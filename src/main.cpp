@@ -12,7 +12,7 @@ static std::vector<int8_t> ref_inter[4];
 static std::vector<float> ref_out;
 static std::vector<float> ref_f32;
 static bool g_has_tiled = true;
-static bool g_has_mma = false;
+static bool g_has_mma = true;
 
 static size_t align256(size_t x) { return (x + 255) / 256 * 256; }
 
@@ -154,5 +154,6 @@ int main(int argc, char** argv) {
     if (mode == "gen") printf("done\n");
     return 0;
 }
+
 
 
