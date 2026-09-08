@@ -1,0 +1,119 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+layout(local_size_x = 128) in;
+
+#ifndef SCOPE_SUBGROUP
+#define SCOPE_SUBGROUP 1
+#endif
+#if SCOPE_SUBGROUP
+#define CM_SCOPE gl_ScopeSubgroup
+#else
+#define CM_SCOPE gl_ScopeWorkgroup
+#endif
+
+layout(constant_id = 0) const int CIN = 16;
+layout(constant_id = 1) const int COUT = 16;
+layout(constant_id = 2) const int COUT_R = 16;
+layout(constant_id = 3) const int LAST = 0;
+layout(constant_id = 4) const int KS = 144;
+layout(constant_id = 5) const int KP = 160;
+layout(constant_id = 6) const int BST = 160;
+
+const int W = 796;
+const int H = 360;
+const int HW = H * W;
+const int NT = COUT / 8;
+const int NSTEP = KP / 32;
+
+layout(std430, binding = 0) readonly buffer InBuf { int8_t ain[]; };
+layout(std430, binding = 1) buffer Out8Buf { int8_t y8[]; };
+layout(std430, binding = 2) readonly buffer WBuf { int8_t wgt[]; };
+layout(std430, binding = 3) readonly buffer BQBuf { int bq[]; };
+layout(std430, binding = 4) readonly buffer MBuf { float mult[]; };
+layout(std430, binding = 5) buffer OutFBuf { float fout[]; };
+
+shared int8_t As[128 * 32];
+shared int8_t Bs[COUT * BST];
+shared int accs[128 * COUT];
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x);
+    int wg = int(gl_WorkGroupID.x);
+
+    for (int i = tid; i < COUT * KP; i += 128) {
+        int k = i / KP;
+        int gk = i % KP;
+        Bs[k * BST + gk] = gk < KS ? wgt[gk * COUT + k] : int8_t(0);
+    }
+    barrier();
+
+    int row0 = wg * 128 + tid;
+    int p = row0 / W;
+    int q = row0 % W;
+
+    int sg = tid / 32;
+    int sbase = sg * 32;
+
+    coopmat<int, CM_SCOPE, 16, 8, gl_MatrixUseAccumulator> acc[NT * 2];
+    for (int i = 0; i < NT * 2; ++i)
+        acc[i] = coopmat<int, CM_SCOPE, 16, 8, gl_MatrixUseAccumulator>(0);
+
+    for (int ks = 0; ks < NSTEP; ++ks) {
+        for (int j = 0; j < 2; ++j) {
+            int gk0 = ks * 32 + j * 16;
+            bool valid = row0 < HW && gk0 < KS;
+            int rs = gk0 / CIN;
+            int c0 = gk0 % CIN;
+            int h = p + rs / 3 - 1;
+            int w = q + rs % 3 - 1;
+            bool inb = valid && h >= 0 && h < H && w >= 0 && w < W;
+            int base = inb ? (h * W + w) * CIN + c0 : 0;
+            int dst = tid * 32 + j * 16;
+            for (int t = 0; t < 16; ++t)
+                As[dst + t] = inb ? ain[base + t] : int8_t(0);
+        }
+        barrier();
+
+        coopmat<int8_t, CM_SCOPE, 16, 32, gl_MatrixUseA> amat0, amat1;
+        coopmat<int8_t, CM_SCOPE, 32, 8, gl_MatrixUseB> bmat[NT];
+
+        coopMatLoad(amat0, As, uint(sbase * 32), 32u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(amat1, As, uint((sbase + 16) * 32), 32u, gl_CooperativeMatrixLayoutRowMajor);
+        for (int ni = 0; ni < NT; ++ni)
+            coopMatLoad(bmat[ni], Bs, uint(ni * 8 * BST + ks * 32), uint(BST),
+                        gl_CooperativeMatrixLayoutColumnMajor);
+
+        for (int ni = 0; ni < NT; ++ni) {
+            acc[ni * 2 + 0] = coopMatMulAdd(amat0, bmat[ni], acc[ni * 2 + 0]);
+            acc[ni * 2 + 1] = coopMatMulAdd(amat1, bmat[ni], acc[ni * 2 + 1]);
+        }
+        barrier();
+    }
+
+    for (int ni = 0; ni < NT; ++ni) {
+        coopMatStore(acc[ni * 2 + 0], accs, uint(sbase * COUT + ni * 8), uint(COUT),
+                     gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(acc[ni * 2 + 1], accs, uint((sbase + 16) * COUT + ni * 8), uint(COUT),
+                     gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+
+    for (int i = tid; i < 128 * COUT; i += 128) {
+        int r = i / COUT;
+        int k = i % COUT;
+        if (k >= COUT_R) continue;
+        int gr = wg * 128 + r;
+        if (gr >= HW) continue;
+        int v = accs[r * COUT + k] + bq[k];
+        if (LAST != 0) {
+            fout[gr * COUT_R + k] = float(v) * mult[k];
+        } else {
+            int y = int(roundEven(float(v) * mult[k]));
+            y = clamp(y, 0, 127);
+            y8[gr * COUT_R + k] = int8_t(y);
+        }
+    }
+}
