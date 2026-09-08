@@ -141,9 +141,7 @@ int main(int argc, char** argv) {
     };
 
     if (mode == "test" || mode == "all") {
-        if (g_has_mma) {
-            if (run_frag_test() != 0) { printf("frag test FAILED\n"); return 1; }
-        }
+        if (run_frag_test() != 0) { printf("frag test FAILED`n"); return 1; }
         bool ok = true;
         for (auto& im : impls)
             if (im.enabled) ok = validate_impl(im.name, im.fn) && ok;
@@ -156,4 +154,5 @@ int main(int argc, char** argv) {
     if (mode == "gen") printf("done\n");
     return 0;
 }
+
 
