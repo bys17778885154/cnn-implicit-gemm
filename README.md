@@ -2,6 +2,9 @@
 
 5 层 3×3 int8 CNN 推理,RTX 4090 Laptop (SM89),仅用 `mma.sync` + `ldmatrix`(无 cp.async)。
 
+> mma/ldmatrix fragment 布局、K 排序、swizzle、双缓冲流水线的图解详解见
+> **[docs/mma-kernels.md](docs/mma-kernels.md)**(覆盖 m16n8k32 真实版与 m16n16k32 假想对照版,tmp/mma_n16_hypothesis.cu)。
+
 ## 模型
 
 conv(4→16)+ReLU → conv(16→32)+ReLU → conv(32→16)+ReLU → conv(16→16)+ReLU → conv(16→4) → NHWC 输出
