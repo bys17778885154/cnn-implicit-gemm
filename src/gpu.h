@@ -16,4 +16,5 @@ using ChainFn = void(*)(const GpuModel& g, float* layer_ms, int last_layer);
 void conv5_naive_chain(const GpuModel& g, float* layer_ms, int last_layer);
 void conv5_tiled_chain(const GpuModel& g, float* layer_ms, int last_layer);
 void conv5_mma_chain(const GpuModel& g, float* layer_ms, int last_layer);
+void conv5_mma32_chain(const GpuModel& g, float* layer_ms, int last_layer);
 int run_frag_test();

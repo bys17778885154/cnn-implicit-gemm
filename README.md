@@ -20,21 +20,24 @@ build\conv5.exe gen         # 重新生成 weights.bin / input.bin
 
 | 实现 | L0 | L1 | L2 | L3 | L4 | total | 有效带宽 |
 |---|---|---|---|---|---|---|---|
-| v1 naive | 0.904 | 1.801 | 1.789 | 0.905 | 0.232 | 5.632 ms | 9.8 GB/s |
-| v2 smem 分块 | 0.573 | 1.134 | 1.201 | 0.581 | 0.180 | 3.669 ms | 15.0 GB/s |
-| **v3 mma+ldmatrix** | **0.043** | **0.089** | **0.105** | **0.043** | **0.033** | **0.313 ms** | **175.6 GB/s** |
+| v1 naive | 0.902 | 1.798 | 1.787 | 0.906 | 0.231 | 5.625 ms | 9.8 GB/s |
+| v2 smem 分块 | 0.571 | 1.132 | 1.191 | 0.575 | 0.177 | 3.646 ms | 15.1 GB/s |
+| v3 mma k16 | 0.042 | 0.088 | 0.104 | 0.043 | 0.032 | 0.309 ms | 178.0 GB/s |
+| **v3 mma k32** | 0.044 | 0.086 | **0.074** | 0.044 | 0.032 | **0.279 ms** | **197.7 GB/s** |
 
-- v3 相对 v1 提速 **18×**,相对 v2 提速 **11.7×**
+- `mma.sync.m16n8k16.s8` 版相对 v1 提速 **18×**;`m16n8k32` 版再快 **10%**(总计 20×)
+- k32 收益集中在 L2(K=288=9×32 整除,-29%);K=144 的层 = 4 个 k32 步 + 1 个 k16 残尾步,收益被尾步抵消(±0)
 - 三个版本与 CPU int8 参考**逐层 bit-exact**(整型累加无舍入,验收为精确相等)
 - vs CPU fp32 参考:平均绝对误差 0.023(参考输出均值 0.904,平均相对误差 ≈ 2.6%,per-tensor 对称量化的固有噪声水平)
 
 ## v3 kernel 要点(src/conv_mma.cu)
 
 - implicit GEMM:M=286560(NPQ) × N=C_out × K=C_in×9;K 排序 `gemm_k = c + C_in*(s+3r)`,每个 k16 块 = 同一 (r,s) 的 16 个连续通道 = NHWC 中 16B 连续向量
-- block tile 128 行 × 全部输出通道;4 warps 沿 M 划分;`mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32`
+- block tile 128 行 × 全部输出通道;4 warps 沿 M 划分;`mma.sync.m16n8k16/k32.row.col.s32.s8.s8.s32`
 - 权重整块常驻 smem(n 主序,K 连续;K=288 时行距 pad 到 304B=19×16B 保 ldmatrix 无 bank conflict)
 - A 双缓冲(LDG→寄存器→STS,SM75 风格,无 cp.async):先发下一 k-step 的 LDG,再对当前 buffer ldmatrix+mma,再 STS 到另一 buffer
 - `ldmatrix.x4` 装 A(32 行),`ldmatrix.x1/x2/x4` 装 B(N/8 个 n8 tile);s8 打包:b16 = 2×int8
+- k32 变体:A tile 行宽 32B(2×16B chunk),chunk 位置按 `(chunk ^ (row>>2 & 1))` XOR swizzle 消 bank conflict;B 用一条 x4 同时装 2 个 n8 tile 的 k0-31;K=144 层走 4×k32 + 1×k16 残尾
 - epilogue:bias + requant(`__float2int_rn(acc*mult)` clamp[0,127],ReLU 折叠进下界)+ 散写;L4 直接 dequant 写 fp32 NHWC
 - 资源占用:32-56 寄存器 / 5-9KB smem / 零 spill
 

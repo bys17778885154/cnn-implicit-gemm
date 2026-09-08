@@ -134,10 +134,11 @@ int main(int argc, char** argv) {
     cudaMemcpy((void*)gm.a0, a0.data(), a0.size(), cudaMemcpyHostToDevice);
 
     struct Impl { const char* name; ChainFn fn; bool enabled; };
-    Impl impls[3] = {
+    Impl impls[4] = {
         { "naive", conv5_naive_chain, true },
         { "tiled", conv5_tiled_chain, g_has_tiled },
         { "mma",   conv5_mma_chain,   g_has_mma },
+        { "mma32", conv5_mma32_chain, g_has_mma },
     };
 
     if (mode == "test" || mode == "all") {
