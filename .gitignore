@@ -5,3 +5,6 @@ build/
 *.spv
 *.txt
 
+*.nsys-rep
+*.sqlite
+*.csv
