@@ -23,11 +23,18 @@ layout(constant_id = 4) const int KS = 144;
 layout(constant_id = 5) const int KP = 160;
 layout(constant_id = 6) const int BST = 160;
 layout(constant_id = 7) const int BM = 256;
+layout(constant_id = 8) const int CG = 16;
+
+#ifdef USE_N16
+#define BN 16
+#else
+#define BN 8
+#endif
 
 const int W = 796;
 const int H = 360;
 const int HW = H * W;
-const int NT = COUT / 8;
+const int NT = COUT / BN;
 const int NSTEP = KP / 32;
 const int BST4 = BST / 4;
 
@@ -77,7 +84,7 @@ void main() {
     for (int i = tid; i < COUT * BST; i += 192) {
         int k = i / BST;
         int gk = i % BST;
-        Bs[i] = gk < KS ? wgt[gk * COUT + k] : int8_t(0);
+        Bs[i] = (gk < KS && k < CG) ? wgt[gk * CG + k] : int8_t(0);
     }
 
     int row0 = wg * BM + tid;
@@ -87,9 +94,9 @@ void main() {
     stage_tile(tid, row0, 0, 0, 0);
     barrier();
 
-    coopmat<int, CM_SCOPE, 16, 8, gl_MatrixUseAccumulator> acc[NT * 2];
+    coopmat<int, CM_SCOPE, 16, BN, gl_MatrixUseAccumulator> acc[NT * 2];
     for (int i = 0; i < NT * 2; ++i)
-        acc[i] = coopmat<int, CM_SCOPE, 16, 8, gl_MatrixUseAccumulator>(0);
+        acc[i] = coopmat<int, CM_SCOPE, 16, BN, gl_MatrixUseAccumulator>(0);
 
     for (int ks = 0; ks < NSTEP; ++ks) {
         int32_t nr[8];
@@ -122,12 +129,12 @@ void main() {
 
         int buf = ks & 1;
         coopmat<int8_t, CM_SCOPE, 16, 32, gl_MatrixUseA> amat0, amat1;
-        coopmat<int8_t, CM_SCOPE, 32, 8, gl_MatrixUseB> bmat[NT];
+        coopmat<int8_t, CM_SCOPE, 32, BN, gl_MatrixUseB> bmat[NT];
 
         coopMatLoad(amat0, As, uint(buf * BM * 8 + sbase * 8), 8u, gl_CooperativeMatrixLayoutRowMajor);
         coopMatLoad(amat1, As, uint(buf * BM * 8 + (sbase + 16) * 8), 8u, gl_CooperativeMatrixLayoutRowMajor);
         for (int ni = 0; ni < NT; ++ni)
-            coopMatLoad(bmat[ni], Bs, uint(ni * 8 * BST + ks * 32), uint(BST),
+            coopMatLoad(bmat[ni], Bs, uint(ni * BN * BST + ks * 32), uint(BST),
                         gl_CooperativeMatrixLayoutColumnMajor);
 
         for (int ni = 0; ni < NT; ++ni) {
@@ -149,7 +156,7 @@ void main() {
         if (sg == s) {
             for (int mi = 0; mi < 2; ++mi)
                 for (int ni = 0; ni < NT; ++ni)
-                    coopMatStore(acc[ni * 2 + mi], escr, uint(mi * 16 * COUT + ni * 8), uint(COUT),
+                    coopMatStore(acc[ni * 2 + mi], escr, uint(mi * 16 * COUT + ni * BN), uint(COUT),
                                  gl_CooperativeMatrixLayoutRowMajor);
         }
         barrier();

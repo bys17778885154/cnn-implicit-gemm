@@ -14,21 +14,18 @@ conv(4→16)+ReLU → conv(16→32)+ReLU → conv(32→16)+ReLU → conv(16→16
 ## 构建与运行
 
 ```
-powershell build.ps1        # glslc x4 变体(subgroup/workgroup × conv/smoke)+ cl 链接 host
-build\vkconv5.exe test      # coopmat 冒烟测试 + 5 层逐层 bit-exact 验证(含属性查询)
-build\vkconv5.exe bench     # 四口径并列:GPU 时间戳和 / 逐层 submit wall / 合并 wall
-build\vkconv5.exe benchmany # 合并稳态:100 链一条提交,取每链均值
-build\vkconv5.exe dump      # 导出 out_vk.bin + out_cpu.bin(跨实现逐位比对)
+powershell build.ps1        # glslc x6 变体(subgroup/workgroup × n8/n16/smoke)+ cl 链接 host
+build\vkconv5.exe test      # 冒烟测试 + n8/n16 双版本逐层 bit-exact 验证(含属性查询)
+build\vkconv5.exe bench     # 四口径并列(n8 与 n16 自动对比)
+build\vkconv5.exe benchmany # 合并稳态:100 链一条提交(n8 与 n16)
+build\vkconv5.exe dump      # 导出 out_vk.bin + out_cpu.bin(跨实现逐位比对,n8)
 ```
 
 - 环境:Vulkan SDK 1.4.350(glslc)+ NVIDIA 驱动 596.36 / API 1.4.329;设备枚举显式挑 NVIDIA(跳过 Intel 核显)
 - weights.bin / input.bin 与 CUDA 版共用同一生成逻辑(`../common/gen_weights.cpp`,确定性生成,逐位一致)
 - 运行时查询 coopmat 属性并断言 **M=16 N=8 K=32 s8/s8/s32**(scope=subgroup),同时打印驱动暴露的全部形态
-  (含 M=16 N=16 K=32 s8——即 CUDA 版假想文档里的 "m16n16k32",在 coopmat 层真实存在)
 
 ## 实测结果(RTX 4090 Laptop,交替背靠背同窗口测量)
-
-**四方口径对比**(每格 20 次平均,交替运行 3 轮取中位):
 
 | 路径 | GPU 吞吐 | 端到端 wall |
 |---|---|---|
@@ -41,80 +38,79 @@ build\vkconv5.exe dump      # 导出 out_vk.bin + out_cpu.bin(跨实现逐位比
 SHA256 完全相同(`0DA656256659892F...`,1,146,240 个 fp32)。
 
 结论:
-- CUDA 全口径领先约 1.5×(0.29 vs 0.40-0.43ms)。合并 cmdbuffer 让 Vulkan 端到端快 ~35%
-  (0.65→0.42ms,5 次 host 提交往返变 1 次),但追不平 CUDA:CUDA kernel 异步发射开销仅
-  ~2-5µs/个,而 Vulkan 路径每个 dispatch 有 ~80µs 的固定成本(推测来自
-  驱动的 compute pipeline 切换/barrier 处理,与 SM 频率无关)
-- 笔记本 GPU 时钟波动注记:CUDA 偶发 boost 状态下可达 0.16ms(344 GB/s),同 exe 复测回落
-  0.28ms;跨会话数字不可直接比,本表为交替背靠背口径
+- CUDA 全口径领先约 1.5×;合并 cmdbuffer 让 Vulkan 端到端快 ~35%,但每 dispatch ~80µs
+  固定成本(CUDA kernel 发射仅 ~2-5µs)是 API 层调度差距,详见顶层 README 性能汇总
+- 笔记本 GPU 时钟波动注记:跨会话数字不可直接比,跨实现对比一律交替背靠背口径
 - bench 尾部自动做完整性校验:下载最终输出与 CPU 参考精确比对,通过才输出成绩
+
+## N=16 形态支持与实测(coopmat 的 "m16n16k32")
+
+驱动属性转储中存在 **M=16 N=16 K=32 s8/s8/s32**(scope=subgroup),shader 通过 `USE_N16`
+宏支持(`coopmat<int8,32,16,B>` + `coopmat<int,16,16,Acc>`;B 装载保持标量 int8
+column-major 规避已知驱动 bug;L4 的 C_out=8 pad 到 16,新增 spec-const `CG` 区分全局权重
+行宽与 shader COUT)。test/bench/benchmany 自动双版本对比:
+
+| 形态 | L0 | L1 | L2 | L3 | L4 | benchmany | bit-exact |
+|---|---|---|---|---|---|---|---|
+| N=8(32×8 B) | 0.065 | 0.113 | 0.123 | 0.065 | 0.050 | **0.426 ms** | ✅ |
+| N=16(32×16 B) | 0.065 | 0.113 | 0.124 | 0.065 | 0.061 | 0.433 ms(-1.8%) | ✅ |
+
+实证了 `../cuda/docs/mma-kernels.md` 假想分析的两个预测:
+- MulAdd 指令数减半**几乎不可见**——本 kernel 延迟/dispatch 受限(tensor 利用率 ~10%),
+  不是 mma issue 受限;n16 只省每步指令数,不减迭代次数与 barrier
+- L4(C_out=4→pad 16)按预测明显负收益(0.050→0.061ms,+22%):一半 tile 空转
+- 该形态适合 C_out ≥ 128 的 compute-bound 卷积,不适合本网络
 
 ## kernel 要点(shaders/conv5_coopmat.comp)
 
-- 与 CUDA mma32 版一一对应:`coopmat<int8,16,32,A>` × `coopmat<int8,32,8,B>` +
-  `coopmat<int,16,8,Acc>` ≡ `mma.sync.m16n8k32.s8`;workgroup 192 线程 = 6 subgroups,
-  每 subgroup 32 行(M)× C_out(N),2×m16 × NT×n8 个累加器
-- **A 路径 = 手动 im2col 中转**(coopmatLoad 只支持连续行 + stride,不支持任意行间接寻址):
-  每线程按 `gemm_k = c + C_in*(s+3r)` 排序寻址,4×int32 向量加载 + 位拆包,
-  打包成 `i8vec4` 写入 workgroup shared,barrier 后 `coopMatLoad`(row-major, stride 8×4B)
-- **B 常驻 shared**(n 主序 `[C_out][K_pad]`,pad 字节清零),`coopMatLoad`(column-major, stride BST)
-  ——K=144 统一 pad 到 160(5×32 步,1/9 mma 浪费,单一代码路径;CUDA 版走 k16 残尾步)
-- **双缓冲**:下一 k-step 的加载先入 8×int32 寄存器,当前 buffer 上 coopmat 装载 + MulAdd,
-  再 STS 到另一 buffer,每步仅 1 次 barrier
-- epilogue:按 subgroup 分 6 轮——每轮该 subgroup 把自己的 2×NT 个 16×8 tile
-  `coopMatStore` 到 **单 subgroup 整行 scratch `[32][COUT]`**(行宽 = 完整 COUT),
-  barrier 后全 192 线程 requant 写回 `int(roundEven(float(acc+bias_q)*mult))` clamp(0,127)
-  (ReLU 折叠进下界);L4 直写 fp32 NHWC
-- **shared 峰值 21KB(L1 层)**,全部 ≤40KB 约束内:As 12KB(双缓冲 2×192×32B)+
-  Bs 1.3-5KB + escr 1-4KB → L0/L3 16.5KB、L2 18.5KB、L1 21KB、L4 14.25KB
-- **epilogue scratch 的两次演进(实测数据)**:
-  1. 整块 `[BM][COUT]` accs(24KB,L1 总 41KB):0.47ms——写回合并度最好但超 40KB 约束
-  2. per-subgroup 16×8 tile 乒乓(6KB):0.71ms(+50%)——8B 碎片写回,负优化,已回滚
-  3. **现行:单 subgroup 整行 `[32][COUT]`(4KB,L1 总 21KB):0.40-0.43ms(-11%)**
-     ——行宽不变保住 16/32B 连续写,占用率提升(L1 2→4 blocks/SM)真正兑现
-- 双 scope 宏变体(subgroup/workgroup)预编译,按运行时查询结果选择
+- 与 CUDA mma32 版一一对应:`coopmat<int8,16,32,A>` × `coopmat<int8,32,8|16,B>` +
+  `coopmat<int,16,8|16,Acc>` ≡ `mma.sync.m16n8k32.s8`(n16 形态见上节);workgroup 192 线程
+  = 6 subgroups,每 subgroup 32 行(M)× C_out(N)
+- **A 路径 = 手动 im2col 中转**(coopmatLoad 只支持连续行 + stride):每线程按
+  `gemm_k = c + C_in*(s+3r)` 排序寻址,4×int32 向量加载 + 位拆包,打包 `i8vec4` 写入
+  workgroup shared,barrier 后 `coopMatLoad`(row-major, stride 8×4B)
+- **B 常驻 shared**(n 主序 `[C_out][K_pad]`,pad 清零),`coopMatLoad`(column-major, stride BST);
+  K=144 统一 pad 到 160(单一代码路径;CUDA 版走 k16 残尾步)
+- **双缓冲**:下一 k-step 加载先入 8×int32 寄存器,当前 buffer 上装载 + MulAdd,再 STS 到
+  另一 buffer,每步仅 1 次 barrier
+- epilogue:按 subgroup 分 6 轮,`coopMatStore` 到单 subgroup 整行 scratch `[32][COUT]`
+  (保持 16/32B 连续写回),全 192 线程 requant
+  `int(roundEven(float(acc+bias_q)*mult))` clamp(0,127);L4 直写 fp32 NHWC
+- **shared 峰值 21KB(L1 层)**,满足 40KB 约束;演进数据见 git 历史
+  (整块 accs 41KB / 16×8 tile 碎片写负优化 / 现行整行 scratch +11% 提速)
+- 双 scope 宏(subgroup/workgroup)+ N=8/16 宏共 4 个 conv spv 变体预编译
 
 ## 冒烟测试(shaders/smoke.comp)
 
 单条 16×32×8 s8 coopmat vs CPU 精确矩阵乘,bit-exact 才放行——镜像 CUDA 版 mma_test.cu 的纪律;
-且带 `CM_AELEM/CM_BELEM/stride` 探针参数,曾用它实锤驱动 bug(见踩坑 2)。
+带 `CM_AELEM/CM_BELEM/stride` 探针参数,曾用它实锤驱动 bug(见踩坑 2)。
 
 ## 踩坑记录
 
-1. **未初始化的 VkWriteDescriptorSet / VkDescriptorSetLayoutBinding**:pNext / dstArrayElement /
-   pImmutableSamplers 是栈上垃圾,驱动解引用直接 AV,且表现为"延迟崩溃"在无关的后续堆分配处
-   ——所有 Vulkan 栈上结构体一律 `= {}` 零初始化
+1. **未初始化的 VkWriteDescriptorSet / VkDescriptorSetLayoutBinding**:栈上垃圾被驱动解引用
+   直接 AV,表现为延迟崩溃——Vulkan 栈上结构体一律 `= {}` 零初始化
 2. **驱动 bug(实测确认)**:`coopMatLoad` 对 **vec4 类型 buffer + column-major + 非零 element**
-   组合返回错误数据(smoke 探针复现);row-major + vec4 + 非零 element 正常。规避:B 路径用标量
-   `int8_t[]`(element/stride 单位=字节)
-3. **驱动 bug(实测确认)**:合并 command buffer 内的**多组 timestamp 在 fence 完成后仍不可用**
-   (`vkGetQueryPoolResults`+WAIT 挂死或返回 0),单提交单组 timestamp 正常。规避:整链只测
-   wall(QPC),per-layer 计时用单层独立提交
-4. **`vkAllocateDescriptorSets` 批量分配时 `pSetLayouts` 必须指向数组**:count=5 却传单个 layout
-   指针,驱动越界读栈垃圾,分配"成功"但 set 已损坏,后续录制静默崩溃
-5. **"空 command buffer" 测量陷阱(本项目最大教训)**:`run_chain(-1)` 中 `l <= -1` 使录制循环
-   一次都不执行 → 空 cmdbuffer 提交,fence 几十微秒即完成,**被误读为 6.7× 提速**;更隐蔽的是
-   `all` 模式下 bench 的赛后校验下载到的是 **validate 阶段残留的正确结果**,假象双重自洽。
-   修正:①计数循环用显式边界;②计时基准用 benchmany(100 链一条提交取均值,排除单次假象);
-   ③完整性校验必须在"该进程内该路径确实执行过"之后立即做,且成功要显式打印
-6. **local_size 与协作循环步长必须单点定义**:装载循环 `i += N` 的 N 与 `local_size_x` 不同步时
-   数组只被初始化一半——无报错、结果错,且会污染二分调试
-7. GLSL KHR coopmat 命名与 NV 不同:`gl_MatrixUseA/B/Accumulator`(非 MatrixType)、
-   `gl_CooperativeMatrixLayoutRowMajor/ColumnMajor`、`coopMatLoad(m, buf数组, element下标, stride,
-   layout)`——以 KhronosGroup/GLSL 仓库的 GLSL_KHR_cooperative_matrix.txt 为准;
-   element/stride 单位 = buffer 元素类型(int8 buffer 即字节,i8vec4 buffer 即 4 字节)
-8. coopmat 的 buf 参数要传一维数组(shared 需手动扁平化),element 是起始下标(不是指针)
-9. 枚举名是 `VK_COMPONENT_TYPE_SINT8_KHR`(非 SIGNED_INT8);`int32_t` 需
-   `GL_EXT_shader_explicit_arithmetic_types_int32`;`gl_ScopeSubgroup` 等常量需
+   返回错误数据(smoke 探针复现);row-major + vec4 正常。规避:B 路径用标量 `int8_t[]`
+3. **驱动 bug(实测确认)**:合并 cmdbuffer 内**多组 timestamp 在 fence 完成后不可用**;
+   规避:整链 wall 计时(QPC),per-layer 单层提交计时
+4. **`vkAllocateDescriptorSets` 批量分配 `pSetLayouts` 必须指向数组**:count=5 传单个指针
+   → set 损坏,录制时静默崩溃
+5. **"空 command buffer" 测量陷阱**:`l <= -1` 循环零执行 → 空 cb 提交被误读为 6.7× 提速;
+   `all` 模式残留结果又骗过完整性校验。修正:显式循环边界 + benchmany 均值 + 校验即时显式打印
+6. **local_size 与协作循环步长必须单点定义**:不同步 → 数组半初始化,静默出错
+7. GLSL KHR coopmat 命名:`gl_MatrixUseA/B/Accumulator`、`gl_CooperativeMatrixLayoutRowMajor/
+   ColumnMajor`、`coopMatLoad(m, buf数组, element下标, stride, layout)`;element/stride 单位 =
+   buffer 元素类型
+8. coopmat 的 buf 参数传一维数组(shared 手动扁平化),element 是起始下标
+9. 枚举名 `VK_COMPONENT_TYPE_SINT8_KHR`;`int32_t` 需 int32 扩展;`gl_ScopeSubgroup` 需
    `GL_KHR_memory_scope_semantics`
 
 ## 目录
 
 ```
-build.ps1                    一键构建(glslc x4 + cl)
-shaders/conv5_coopmat.comp   主 kernel(手动 im2col + coopmat,spec-constants 参数化 5 层)
+build.ps1                    一键构建(glslc x6 + cl)
+shaders/conv5_coopmat.comp   主 kernel(USE_N16/SCOPE 宏变体,spec-constants 参数化)
 shaders/smoke.comp           coopmat 冒烟测试 + 布局/驱动探针
-src/main.cpp                 Vulkan host:设备/扩展/属性查询、单 buffer 6 bindings、
-                             5 管线 spec-const、逐层下载 memcmp、四口径计时
+src/main.cpp                 host:属性查询、双 pipeline 集(n8/n16)、合并提交、四口径计时
 ../common/                   共享层:quant.h / reference.* / gen_weights.cpp(与 CUDA 版共用)
 ```

@@ -35,6 +35,7 @@ struct Ctx {
     VkDescriptorSet ds[5] = {};
     VkPipelineLayout pl = VK_NULL_HANDLE;
     VkPipeline pipes[5] = {};
+    VkPipeline pipesN16[5] = {};
     VkPipeline smokepipe = VK_NULL_HANDLE;
     VkPipelineLayout smokelayout = VK_NULL_HANDLE;
     VkDescriptorSetLayout smokedsl = VK_NULL_HANDLE;
@@ -297,24 +298,32 @@ static void create_pipeline_objects(Ctx& c) {
     VK_CHECK(vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &sci, nullptr, &c.smokepipe));
     vkDestroyShaderModule(c.dev, smod, nullptr);
 
-    for (int l = 0; l < 5; ++l) {
-        int32_t spec[8] = {
-            C_IN_PAD[l], C_OUT_PAD[l], C_OUT_REAL[l], l == 4 ? 1 : 0,
-            K_GEMM[l], (K_GEMM[l] + 31) / 32 * 32, (K_GEMM[l] + 31) / 32 * 32, 192
-        };
-        VkSpecializationMapEntry me[8];
-        for (int i = 0; i < 8; ++i) { me[i].constantID = i; me[i].offset = (uint32_t)(i * 4); me[i].size = 4; }
-        VkSpecializationInfo spi{ 8, me, sizeof(spec), spec };
-        VkComputePipelineCreateInfo ci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        ci.stage.module = mod;
-        ci.stage.pName = "main";
-        ci.stage.pSpecializationInfo = &spi;
-        ci.layout = c.pl;
-        VK_CHECK(vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &ci, nullptr, &c.pipes[l]));
-    }
+    auto createPipes = [&](VkShaderModule m, VkPipeline* out, bool n16) {
+        for (int l = 0; l < 5; ++l) {
+            int shaderCout = n16 ? (C_OUT_PAD[l] < 16 ? 16 : C_OUT_PAD[l]) : C_OUT_PAD[l];
+            int32_t spec[9] = {
+                C_IN_PAD[l], shaderCout, C_OUT_REAL[l], l == 4 ? 1 : 0,
+                K_GEMM[l], (K_GEMM[l] + 31) / 32 * 32, (K_GEMM[l] + 31) / 32 * 32, 192, C_OUT_PAD[l]
+            };
+            VkSpecializationMapEntry me[9];
+            for (int i = 0; i < 9; ++i) { me[i].constantID = i; me[i].offset = (uint32_t)(i * 4); me[i].size = 4; }
+            VkSpecializationInfo spi{ 9, me, sizeof(spec), spec };
+            VkComputePipelineCreateInfo ci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+            ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            ci.stage.module = m;
+            ci.stage.pName = "main";
+            ci.stage.pSpecializationInfo = &spi;
+            ci.layout = c.pl;
+            VK_CHECK(vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &ci, nullptr, &out[l]));
+        }
+    };
+    createPipes(mod, c.pipes, false);
     vkDestroyShaderModule(c.dev, mod, nullptr);
+
+    VkShaderModule mod16 = load_spv(c.dev, c.scope == 3 ? "build/conv_n16_subgroup.spv" : "build/conv_n16_workgroup.spv");
+    createPipes(mod16, c.pipesN16, true);
+    vkDestroyShaderModule(c.dev, mod16, nullptr);
 }
 
 static void set_layer_descriptors(Ctx& c, int l) {
@@ -348,7 +357,7 @@ static void set_layer_descriptors(Ctx& c, int l) {
 
 static bool g_use_barrier = true;
 
-static void record_chain(Ctx& c, int last_layer, bool timing, uint32_t queryBase) {
+static void record_chain(Ctx& c, int last_layer, bool timing, uint32_t queryBase, VkPipeline* pipes) {
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(c.cmd, &bi));
@@ -364,7 +373,7 @@ static void record_chain(Ctx& c, int last_layer, bool timing, uint32_t queryBase
             vkCmdPipelineBarrier(c.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
         }
-        vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipes[l]);
+        vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipes[l]);
         vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pl, 0, 1, &c.ds[l], 0, nullptr);
         vkCmdDispatch(c.cmd, (HW + 191) / 192, 1, 1);
     }
@@ -375,13 +384,13 @@ static void record_chain(Ctx& c, int last_layer, bool timing, uint32_t queryBase
 
 static void submit_and_wait(Ctx& c);
 
-static double time_single_layer(Ctx& c, int l) {
+static double time_single_layer(Ctx& c, int l, VkPipeline* pipes) {
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(c.cmd, &bi));
     vkCmdResetQueryPool(c.cmd, c.qp, 200, 2);
     vkCmdWriteTimestamp(c.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c.qp, 200);
-    vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipes[l]);
+    vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipes[l]);
     vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pl, 0, 1, &c.ds[l], 0, nullptr);
     vkCmdDispatch(c.cmd, (HW + 191) / 192, 1, 1);
     vkCmdWriteTimestamp(c.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c.qp, 201);
@@ -406,16 +415,16 @@ static void submit_and_wait(Ctx& c) {
     VK_CHECK(vkResetCommandBuffer(c.cmd, 0));
 }
 
-static void run_chain(Ctx& c, int last_layer, bool timing, uint32_t queryBase = 0) {
-    record_chain(c, last_layer, timing, queryBase);
+static void run_chain(Ctx& c, int last_layer, bool timing, uint32_t queryBase, VkPipeline* pipes) {
+    record_chain(c, last_layer, timing, queryBase, pipes);
     submit_and_wait(c);
 }
 
-static void run_single_layer_untimed(Ctx& c, int l) {
+static void run_single_layer_untimed(Ctx& c, int l, VkPipeline* pipes) {
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(c.cmd, &bi));
-    vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipes[l]);
+    vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipes[l]);
     vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pl, 0, 1, &c.ds[l], 0, nullptr);
     vkCmdDispatch(c.cmd, (HW + 191) / 192, 1, 1);
     VK_CHECK(vkEndCommandBuffer(c.cmd));
@@ -518,7 +527,7 @@ static bool smoke_test(Ctx& c) {
     return true;
 }
 
-static void validate_chain(Ctx& c) {
+static void validate_chain(Ctx& c, VkPipeline* pipes, const char* label) {
     ModelData m;
     if (!load_model("weights.bin", "input.bin", m)) { printf("no model\n"); exit(1); }
     std::vector<int8_t> inter[4];
@@ -527,15 +536,15 @@ static void validate_chain(Ctx& c) {
     for (int l = 0; l < 5; ++l) set_layer_descriptors(c, l);
     bool ok = true;
     for (int l = 0; l < 5 && ok; ++l) {
-        run_chain(c, l, false);
+        run_chain(c, l, false, 0, pipes);
         char name[32];
         if (l < 4) {
-            snprintf(name, sizeof(name), "coopmat layer %d", l);
+            snprintf(name, sizeof(name), "%s layer %d", label, l);
             size_t bytes = (size_t)HW * C_OUT_PAD[l];
             const VkDeviceSize outOff[5] = { c.off.x0, c.off.x1, c.off.x0, c.off.x1, c.off.outF };
             ok = download_and_cmp(c, outOff[l], bytes, inter[l].data(), name);
         } else {
-            snprintf(name, sizeof(name), "coopmat layer 4");
+            snprintf(name, sizeof(name), "%s layer 4", label);
             ok = download_and_cmp(c, c.off.outF, (size_t)HW * 16, ref_out.data(), name);
         }
         if (ok && l == 4) {
@@ -547,15 +556,15 @@ static void validate_chain(Ctx& c) {
                 double d = fabs((double)g[i] - (double)ref_f32[i]);
                 if (d > maxabs) maxabs = d;
             }
-            printf("[ OK ] coopmat: int8 chain bit-exact (vs fp32 max_abs=%.5f)\n", maxabs);
+            printf("[ OK ] %s: int8 chain bit-exact (vs fp32 max_abs=%.5f)\n", label, maxabs);
         }
     }
 }
 
-static void bench(Ctx& c, const ModelData& m) {
+static void bench(Ctx& c, const ModelData& m, VkPipeline* pipes, const char* label) {
     for (int l = 0; l < 5; ++l) set_layer_descriptors(c, l);
     vkResetQueryPool(c.dev, c.qp, 0, 512);
-    for (int i = 0; i < 3; ++i) run_chain(c, 4, false, 0);
+    for (int i = 0; i < 3; ++i) run_chain(c, 4, false, 0, pipes);
     const int iters = 20;
     float acc[5] = { 0, 0, 0, 0, 0 };
     double wall = 0;
@@ -564,7 +573,7 @@ static void bench(Ctx& c, const ModelData& m) {
     QueryPerformanceFrequency(&freq);
     for (int i = 0; i < iters; ++i) {
         QueryPerformanceCounter(&t0);
-        run_chain(c, 4, true, (uint32_t)(i * 2));
+        run_chain(c, 4, true, (uint32_t)(i * 2), pipes);
         QueryPerformanceCounter(&t1);
         wall += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
         uint64_t ts[2] = {};
@@ -574,18 +583,18 @@ static void bench(Ctx& c, const ModelData& m) {
     }
     for (int l = 0; l < 5; ++l)
         for (int i = 0; i < iters; ++i)
-            acc[l] += (float)time_single_layer(c, l);
+            acc[l] += (float)time_single_layer(c, l, pipes);
     double perlayer_wall = 0;
     for (int i = 0; i < iters; ++i) {
         QueryPerformanceCounter(&t0);
-        for (int l = 0; l < 5; ++l) run_single_layer_untimed(c, l);
+        for (int l = 0; l < 5; ++l) run_single_layer_untimed(c, l, pipes);
         QueryPerformanceCounter(&t1);
         perlayer_wall += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
     }
     double bytes = (double)HW * (16 + 16) + (double)HW * (16 + 32) + (double)HW * (32 + 16) +
                    (double)HW * (16 + 16) + (double)HW * (16 + 16);
     double lsum = 0;
-    printf("%-8s", "coopmat");
+    printf("%-12s", label);
     for (int l = 0; l < 5; ++l) {
         double v = acc[l] / iters;
         lsum += v;
@@ -623,12 +632,16 @@ int main(int argc, char** argv) {
 
     if (mode == "test" || mode == "all") {
         if (!smoke_test(c)) return 1;
-        validate_chain(c);
+        validate_chain(c, c.pipes, "coopmat-n8");
+        validate_chain(c, c.pipesN16, "coopmat-n16");
     }
-    if (mode == "bench" || mode == "all") bench(c, m);
+    if (mode == "bench" || mode == "all") {
+        bench(c, m, c.pipes, "coopmat-n8");
+        bench(c, m, c.pipesN16, "coopmat-n16");
+    }
     if (mode == "dump" || mode == "all") {
         for (int l = 0; l < 5; ++l) set_layer_descriptors(c, l);
-        run_chain(c, 4, false, 0);
+        run_chain(c, 4, false, 0, c.pipes);
         ModelData m2;
         load_model("weights.bin", "input.bin", m2);
         std::vector<int8_t> inter[4];
@@ -663,37 +676,42 @@ int main(int argc, char** argv) {
         const int reps = 100, iters = 10;
         LARGE_INTEGER freq, t0, t1;
         QueryPerformanceFrequency(&freq);
-        for (int i = 0; i < 3; ++i) run_chain(c, 4, false, 0);
-        double wall = 0;
-        for (int it = 0; it < iters; ++it) {
-            VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            VK_CHECK(vkBeginCommandBuffer(c.cmd, &bi));
-            for (int r = 0; r < reps; ++r)
-                for (int l = 0; l < 5; ++l) {
-                    if (l > 0 || r > 0) {
-                        VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-                                            VK_ACCESS_SHADER_WRITE_BIT,
-                                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
-                        vkCmdPipelineBarrier(c.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        struct V { VkPipeline* p; const char* n; } vs[2] = { { c.pipes, "n8" }, { c.pipesN16, "n16" } };
+        for (auto& v : vs) {
+            for (int i = 0; i < 3; ++i) run_chain(c, 4, false, 0, v.p);
+            double wall = 0;
+            for (int it = 0; it < iters; ++it) {
+                VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                VK_CHECK(vkBeginCommandBuffer(c.cmd, &bi));
+                for (int r = 0; r < reps; ++r)
+                    for (int l = 0; l < 5; ++l) {
+                        if (l > 0 || r > 0) {
+                            VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                                VK_ACCESS_SHADER_WRITE_BIT,
+                                                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
+                            vkCmdPipelineBarrier(c.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+                        }
+                        vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, v.p[l]);
+                        vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pl, 0, 1, &c.ds[l], 0, nullptr);
+                        vkCmdDispatch(c.cmd, (HW + 191) / 192, 1, 1);
                     }
-                    vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipes[l]);
-                    vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pl, 0, 1, &c.ds[l], 0, nullptr);
-                    vkCmdDispatch(c.cmd, (HW + 191) / 192, 1, 1);
-                }
-            VK_CHECK(vkEndCommandBuffer(c.cmd));
-            QueryPerformanceCounter(&t0);
-            submit_and_wait(c);
-            QueryPerformanceCounter(&t1);
-            wall += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+                VK_CHECK(vkEndCommandBuffer(c.cmd));
+                QueryPerformanceCounter(&t0);
+                submit_and_wait(c);
+                QueryPerformanceCounter(&t1);
+                wall += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+            }
+            printf("benchmany[%s]: %d reps x 5 layers in one submit: per-chain = %.4f ms (%.1f GB/s eff)\n",
+                   v.n, reps, wall / iters / reps,
+                   44.0 / (wall / iters / reps));
         }
-        printf("benchmany: %d reps x 5 layers in one submit: per-chain = %.4f ms (%.1f GB/s eff)\n",
-               reps, wall / iters / reps,
-               44.0 / (wall / iters / reps));
     }
     return 0;
 }
+
+
 
 
 

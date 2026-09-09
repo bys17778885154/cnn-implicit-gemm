@@ -8,6 +8,10 @@ New-Item -ItemType Directory -Force -Path build | Out-Null
 if ($LASTEXITCODE -ne 0) { Write-Output "shader compile failed"; exit 1 }
 & $glslc --target-env=vulkan1.3 -O -DSCOPE_SUBGROUP=0 -o build\conv_workgroup.spv shaders\conv5_coopmat.comp
 if ($LASTEXITCODE -ne 0) { Write-Output "shader compile failed"; exit 1 }
+& $glslc --target-env=vulkan1.3 -O -DSCOPE_SUBGROUP=1 -DUSE_N16 -o build\conv_n16_subgroup.spv shaders\conv5_coopmat.comp
+if ($LASTEXITCODE -ne 0) { Write-Output "shader compile failed"; exit 1 }
+& $glslc --target-env=vulkan1.3 -O -DSCOPE_SUBGROUP=0 -DUSE_N16 -o build\conv_n16_workgroup.spv shaders\conv5_coopmat.comp
+if ($LASTEXITCODE -ne 0) { Write-Output "shader compile failed"; exit 1 }
 & $glslc --target-env=vulkan1.3 -O -DSCOPE_SUBGROUP=1 -o build\smoke_subgroup.spv shaders\smoke.comp
 if ($LASTEXITCODE -ne 0) { Write-Output "smoke compile failed"; exit 1 }
 & $glslc --target-env=vulkan1.3 -O -DSCOPE_SUBGROUP=0 -o build\smoke_workgroup.spv shaders\smoke.comp
