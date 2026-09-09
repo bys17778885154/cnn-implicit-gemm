@@ -1,4 +1,4 @@
-#include "../src/quant.h"
+#include "quant.h"
 #include <cstdio>
 #include <random>
 
@@ -151,3 +151,4 @@ bool load_model(const char* wpath, const char* ipath, ModelData& m) {
     fclose(fi);
     return true;
 }
+

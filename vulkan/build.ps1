@@ -13,6 +13,6 @@ if ($LASTEXITCODE -ne 0) { Write-Output "smoke compile failed"; exit 1 }
 & $glslc --target-env=vulkan1.3 -O -DSCOPE_SUBGROUP=0 -o build\smoke_workgroup.spv shaders\smoke.comp
 if ($LASTEXITCODE -ne 0) { Write-Output "smoke compile failed"; exit 1 }
 
-$src = "src\main.cpp", "..\conv5\src\reference.cpp", "..\conv5\tools\gen_weights.cpp"
-cmd /c "call `"$vcvars`" && cl /nologo /O2 /std:c++17 /openmp /I$sdk\Include /I..\conv5\src $($src -join ' ') /Fe:build\vkconv5.exe /Fo:build\ /link /LIBPATH:$sdk\Lib vulkan-1.lib"
+$src = "src\main.cpp", "..\common\reference.cpp", "..\common\gen_weights.cpp"
+cmd /c "call `"$vcvars`" && cl /nologo /O2 /std:c++17 /openmp /I$sdk\Include /I..\common $($src -join ' ') /Fe:build\vkconv5.exe /Fo:build\ /link /LIBPATH:$sdk\Lib vulkan-1.lib"
 if ($LASTEXITCODE -eq 0 -and (Test-Path build\vkconv5.exe)) { Write-Output "BUILD OK" } else { Write-Output "BUILD FAILED"; exit 1 }
