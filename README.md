@@ -1,9 +1,10 @@
 # conv5
 
-5 层 3×3 int8 CNN 推理,RTX 4090 Laptop (SM89),仅用 `mma.sync` + `ldmatrix`(无 cp.async)。
+5 层 3×3 int8 CNN 推理，RTX 4090 Laptop (SM89),仅用 `mma.sync` + `ldmatrix`(无 cp.async)。
 
 > mma/ldmatrix fragment 布局、K 排序、swizzle、双缓冲流水线的图解详解见
 > **[docs/mma-kernels.md](docs/mma-kernels.md)**(覆盖 m16n8k32 真实版与 m16n16k32 假想对照版,tmp/mma_n16_hypothesis.cu)。
+> Vulkan coopmat 姊妹实现见 `../vkconv5`(同模型同验收,四方口径性能对比在两份 README)。
 
 ## 模型
 

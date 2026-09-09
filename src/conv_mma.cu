@@ -332,6 +332,14 @@ void conv5_mma_chain(const GpuModel& g, float* layer_ms, int last_layer) {
     cudaEventDestroy(e1);
 }
 
+void conv5_mma32_chain_nosync(const GpuModel& g, int reps) {
+    void* bufs[6] = { (void*)g.a0, g.x[0], g.x[1], g.x[0], g.x[1], g.out };
+    for (int r = 0; r < reps; ++r)
+        for (int l = 0; l < 5; ++l)
+            launch_mma((const int8_t*)bufs[l], bufs[l + 1], g.b[l], g.bq[l], g.mult[l], l);
+    cudaDeviceSynchronize();
+}
+
 void conv5_mma32_chain(const GpuModel& g, float* layer_ms, int last_layer) {
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0);

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <windows.h>
 
 static GpuModel gm;
 static ModelData mdl;
@@ -152,9 +153,54 @@ int main(int argc, char** argv) {
         for (auto& im : impls)
             if (im.enabled) bench_impl(im.name, im.fn);
     }
+    if (mode == "dump") {
+        float ms[5];
+        conv5_mma32_chain(gm, ms, -1);
+        std::vector<float> host(HW * 4);
+        cudaMemcpy(host.data(), gm.out, host.size() * 4, cudaMemcpyDeviceToHost);
+        FILE* f = fopen("out_cuda.bin", "wb");
+        fwrite(host.data(), 4, host.size(), f);
+        fclose(f);
+        printf("dumped out_cuda.bin (%zu floats)\n", host.size());
+    }
+    if (mode == "benchcmp") {
+        float ms[5];
+        LARGE_INTEGER freq, t0, t1;
+        QueryPerformanceFrequency(&freq);
+        for (int i = 0; i < 3; ++i) conv5_mma32_chain(gm, ms, 4);
+        const int iters = 20;
+        double wall_sync = 0, gpu_sum = 0;
+        for (int i = 0; i < iters; ++i) {
+            QueryPerformanceCounter(&t0);
+            conv5_mma32_chain(gm, ms, 4);
+            QueryPerformanceCounter(&t1);
+            wall_sync += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+            for (int l = 0; l < 5; ++l) gpu_sum += ms[l];
+        }
+        for (int i = 0; i < 3; ++i) conv5_mma32_chain_nosync(gm, 1);
+        double wall_one = 0;
+        for (int i = 0; i < iters; ++i) {
+            QueryPerformanceCounter(&t0);
+            conv5_mma32_chain_nosync(gm, 1);
+            QueryPerformanceCounter(&t1);
+            wall_one += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+        }
+        for (int i = 0; i < 3; ++i) conv5_mma32_chain_nosync(gm, 100);
+        double wall100 = 0;
+        for (int i = 0; i < iters; ++i) {
+            QueryPerformanceCounter(&t0);
+            conv5_mma32_chain_nosync(gm, 100);
+            QueryPerformanceCounter(&t1);
+            wall100 += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+        }
+        printf("mma32    gpu_sum(per-layer events)=%7.3fms  wall(per-layer sync)=%7.3fms  "
+               "wall(async submit)=%7.3fms  wall(async x100)=%7.3fms\n",
+               gpu_sum / iters, wall_sync / iters, wall_one / iters, wall100 / iters / 100);
+    }
     if (mode == "gen") printf("done\n");
     return 0;
 }
+
 
 
 
