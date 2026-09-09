@@ -16,7 +16,9 @@ conv(4→16)+ReLU → conv(16→32)+ReLU → conv(32→16)+ReLU → conv(16→16
 ```
 powershell build.ps1        # glslc x4 变体(subgroup/workgroup × conv/smoke)+ cl 链接 host
 build\vkconv5.exe test      # coopmat 冒烟测试 + 5 层逐层 bit-exact 验证(含属性查询)
-build\vkconv5.exe bench     # timestamp 计时(3 warmup + 20 次平均)
+build\vkconv5.exe bench     # 四口径并列:GPU 时间戳和 / 逐层 submit wall / 合并 wall
+build\vkconv5.exe benchmany # 合并稳态:100 链一条提交,取每链均值
+build\vkconv5.exe dump      # 导出 out_vk.bin + out_cpu.bin(跨实现逐位比对)
 ```
 
 - 环境:Vulkan SDK 1.4.350(glslc)+ NVIDIA 驱动 596.36 / API 1.4.329;设备枚举显式挑 NVIDIA(跳过 Intel 核显)
