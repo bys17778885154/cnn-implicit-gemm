@@ -27,8 +27,8 @@ weights.bin/input.bin 各目录各持一份(确定性生成,内容逐位一致)�
 
 - **三方逐位一致**:CPU / CUDA / Vulkan 最终输出 SHA256 相同(`0DA656256659892F...`)
 - 四口径性能对比(交替背靠背):CUDA mma32 异步连发 **0.29-0.30ms**,
-  Vulkan coopmat 合并 cmdbuffer 0.47ms;CUDA 全口径领先 1.6-1.7×
-  (Vulkan 每 dispatch ~90µs 固定成本 vs CUDA kernel 发射 ~2-5µs)
+  Vulkan coopmat 合并 cmdbuffer **0.40-0.43ms**(峰值 shared 21KB,满足 40KB 约束);
+  CUDA 全口径领先约 1.5×(Vulkan 每 dispatch ~80µs 固定成本 vs CUDA kernel 发射 ~2-5µs)
 
 ## 历史
 
