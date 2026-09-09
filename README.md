@@ -32,13 +32,15 @@ build\vkconv5.exe bench     # timestamp 计时(3 warmup + 20 次平均)
 | CUDA mma+ldmatrix k32(逐层 launch + event) | 0.279 ms | 198 GB/s | bit-exact |
 | Vulkan coopmat 逐层 dispatch(初版全标量) | 1.352 ms | 41 GB/s | bit-exact |
 | Vulkan coopmat 逐层 dispatch(kernel 优化后) | 0.496 ms | 111 GB/s | bit-exact |
-| **Vulkan coopmat 单 command buffer 合并(5 dispatch + 层间 barrier)** | **0.074 ms** | **746 GB/s** | **bit-exact + 赛后完整性校验** |
+| Vulkan coopmat 单 command buffer 合并(benchmany:100 链/提交) | 0.477 ms | 115 GB/s | bit-exact + 赛后完整性校验 |
 
-- 合并后 **6.7×** 提速并反超 CUDA 版 3.8×。两个来源:①每次独立 submit 约 80µs 的
-  发射/管线排空开销 ×5 被一笔勾销(0.496−0.074 ≈ 0.42ms 恰为该开销);②中间激活
-  (9~18MB)全部驻留 96MB L2,DRAM 实际只进出 ~7MB
-- 注意公平性:CUDA 版的 0.279ms 是"逐层 event 同步"口径,同样含逐层开销;
-  若 CUDA 也做 graph/合并提交,差距会缩小——两边测的是各自当前实现
+**三方逐位一致性已验证**:`dump` 模式导出 CPU / CUDA(mma32)/ Vulkan(合并链)的最终输出,
+SHA256 完全相同(`0DA656256659892F...`,1,146,240 个 fp32)。
+
+- command buffer 合并的真实收益仅 **~4%**(0.496 → 0.477ms),此前宣称的 6.7× 是测量 bug
+  (见踩坑 5)。单次提交的 wall(0.557ms)甚至略慢——host 侧录制/提交开销与 GPU 时间重叠不足
+- coopmat 版与 CUDA k32 的 1.7× 差距仍在:coopmatLoad/Store 驱动黑盒、K pad 到 160、
+  B 每 step 重载——WMMA 级 API 的固有天花板
 - bench 尾部自动做完整性校验:下载最终输出与 CPU 参考精确比对,通过才输出成绩
 
 ## kernel 要点(shaders/conv5_coopmat.comp)
@@ -76,7 +78,12 @@ build\vkconv5.exe bench     # timestamp 计时(3 warmup + 20 次平均)
    wall(QPC),per-layer 计时用单层独立提交
 4. **`vkAllocateDescriptorSets` 批量分配时 `pSetLayouts` 必须指向数组**:count=5 却传单个 layout
    指针,驱动越界读栈垃圾,分配"成功"但 set 已损坏,后续录制静默崩溃
-5. **local_size 与协作循环步长必须单点定义**:装载循环 `i += N` 的 N 与 `local_size_x` 不同步时
+5. **"空 command buffer" 测量陷阱(本项目最大教训)**:`run_chain(-1)` 中 `l <= -1` 使录制循环
+   一次都不执行 → 空 cmdbuffer 提交,fence 几十微秒即完成,**被误读为 6.7× 提速**;更隐蔽的是
+   `all` 模式下 bench 的赛后校验下载到的是 **validate 阶段残留的正确结果**,假象双重自洽。
+   修正:①计数循环用显式边界;②计时基准用 benchmany(100 链一条提交取均值,排除单次假象);
+   ③完整性校验必须在"该进程内该路径确实执行过"之后立即做,且成功要显式打印
+6. **local_size 与协作循环步长必须单点定义**:装载循环 `i += N` 的 N 与 `local_size_x` 不同步时
    数组只被初始化一半——无报错、结果错,且会污染二分调试
 6. GLSL KHR coopmat 命名与 NV 不同:`gl_MatrixUseA/B/Accumulator`(非 MatrixType)、
    `gl_CooperativeMatrixLayoutRowMajor/ColumnMajor`、`coopMatLoad(m, buf数组, element下标, stride,

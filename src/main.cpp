@@ -544,7 +544,7 @@ static void validate_chain(Ctx& c) {
 static void bench(Ctx& c, const ModelData& m) {
     for (int l = 0; l < 5; ++l) set_layer_descriptors(c, l);
     vkResetQueryPool(c.dev, c.qp, 0, 512);
-    for (int i = 0; i < 3; ++i) run_chain(c, -1, false, 0);
+    for (int i = 0; i < 3; ++i) run_chain(c, 4, false, 0);
     const int iters = 20;
     float acc[5] = { 0, 0, 0, 0, 0 };
     double wall = 0;
@@ -553,7 +553,7 @@ static void bench(Ctx& c, const ModelData& m) {
     QueryPerformanceFrequency(&freq);
     for (int i = 0; i < iters; ++i) {
         QueryPerformanceCounter(&t0);
-        run_chain(c, -1, true, (uint32_t)(i * 2));
+        run_chain(c, 4, true, (uint32_t)(i * 2));
         QueryPerformanceCounter(&t1);
         wall += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
         uint64_t ts[2] = {};
@@ -580,7 +580,8 @@ static void bench(Ctx& c, const ModelData& m) {
     cpu_int8(m, inter, ref_out);
     VkDeviceSize outOff[5] = { c.off.x0, c.off.x1, c.off.x0, c.off.x1, c.off.outF };
     (void)outOff;
-    download_and_cmp(c, c.off.outF, (size_t)HW * 16, ref_out.data(), "post-bench integrity");
+    bool pok = download_and_cmp(c, c.off.outF, (size_t)HW * 16, ref_out.data(), "post-bench integrity");
+    if (pok) printf("[ OK ] post-bench integrity: merged-chain output bit-exact\n");
 }
 
 int main(int argc, char** argv) {
@@ -605,8 +606,76 @@ int main(int argc, char** argv) {
         validate_chain(c);
     }
     if (mode == "bench" || mode == "all") bench(c, m);
+    if (mode == "dump" || mode == "all") {
+        for (int l = 0; l < 5; ++l) set_layer_descriptors(c, l);
+        run_chain(c, 4, false, 0);
+        ModelData m2;
+        load_model("weights.bin", "input.bin", m2);
+        std::vector<int8_t> inter[4];
+        std::vector<float> ref_out;
+        cpu_int8(m2, inter, ref_out);
+        bool pok = download_and_cmp(c, c.off.outF, (size_t)HW * 16, ref_out.data(), "dump crosscheck");
+        printf("[ %s ] dump crosscheck via proven download path\n", pok ? "OK" : "FAIL");
+        std::vector<char> host(HW * 16);
+        {
+            VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            VK_CHECK(vkBeginCommandBuffer(c.cmd, &bi));
+            VkBufferCopy cp{ c.off.outF, c.off.outF, (VkDeviceSize)host.size() };
+            vkCmdCopyBuffer(c.cmd, c.bigbuf, c.stgbuf, 1, &cp);
+            VK_CHECK(vkEndCommandBuffer(c.cmd));
+            submit_and_wait(c);
+        }
+        memcpy(host.data(), (char*)c.stgmapped + c.off.outF, host.size());
+        FILE* f1 = fopen("out_vk.bin", "wb");
+        fwrite(host.data(), 1, host.size(), f1);
+        fclose(f1);
+        FILE* f2 = fopen("out_cpu.bin", "wb");
+        fwrite(ref_out.data(), 4, ref_out.size(), f2);
+        fclose(f2);
+        bool same = host.size() == ref_out.size() * 4 &&
+                    memcmp(host.data(), ref_out.data(), host.size()) == 0;
+        printf("[ %s ] dump: out_vk.bin vs out_cpu.bin %s\n", same ? "OK" : "FAIL",
+               same ? "identical" : "DIFFER");
+    }
+    if (mode == "benchmany") {
+        for (int l = 0; l < 5; ++l) set_layer_descriptors(c, l);
+        const int reps = 100, iters = 10;
+        LARGE_INTEGER freq, t0, t1;
+        QueryPerformanceFrequency(&freq);
+        for (int i = 0; i < 3; ++i) run_chain(c, 4, false, 0);
+        double wall = 0;
+        for (int it = 0; it < iters; ++it) {
+            VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            VK_CHECK(vkBeginCommandBuffer(c.cmd, &bi));
+            for (int r = 0; r < reps; ++r)
+                for (int l = 0; l < 5; ++l) {
+                    if (l > 0 || r > 0) {
+                        VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                            VK_ACCESS_SHADER_WRITE_BIT,
+                                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
+                        vkCmdPipelineBarrier(c.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+                    }
+                    vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipes[l]);
+                    vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pl, 0, 1, &c.ds[l], 0, nullptr);
+                    vkCmdDispatch(c.cmd, (HW + 191) / 192, 1, 1);
+                }
+            VK_CHECK(vkEndCommandBuffer(c.cmd));
+            QueryPerformanceCounter(&t0);
+            submit_and_wait(c);
+            QueryPerformanceCounter(&t1);
+            wall += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+        }
+        printf("benchmany: %d reps x 5 layers in one submit: per-chain = %.4f ms (%.1f GB/s eff)\n",
+               reps, wall / iters / reps,
+               44.0 / (wall / iters / reps));
+    }
     return 0;
 }
+
+
 
 
 
