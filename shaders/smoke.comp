@@ -5,17 +5,27 @@
 
 layout(local_size_x = 32) in;
 
-#ifndef SCOPE_SUBGROUP
-#define SCOPE_SUBGROUP 1
+#ifndef CM_AELEM
+#define CM_AELEM 32
 #endif
-#if SCOPE_SUBGROUP
+#ifndef CM_BSTRIDE
+#define CM_BSTRIDE 8
+#endif
+#ifndef CM_BELEM
+#define CM_BELEM 0
+#endif
+#ifndef CM_ASTRIDE
+#define CM_ASTRIDE 8
+#endif
+
+#if 1
 #define CM_SCOPE gl_ScopeSubgroup
 #else
 #define CM_SCOPE gl_ScopeWorkgroup
 #endif
 
-layout(std430, binding = 0) buffer ABuf { int8_t a[]; };
-layout(std430, binding = 1) buffer BBuf { int8_t b[]; };
+layout(std430, binding = 0) buffer ABuf { i8vec4 a4[]; };
+layout(std430, binding = 1) buffer BBuf { i8vec4 b4[]; };
 layout(std430, binding = 2) buffer OBuf { int o[]; };
 
 void main() {
@@ -23,8 +33,11 @@ void main() {
     coopmat<int8_t, CM_SCOPE, 32, 8, gl_MatrixUseB> bm;
     coopmat<int, CM_SCOPE, 16, 8, gl_MatrixUseAccumulator> cm =
         coopmat<int, CM_SCOPE, 16, 8, gl_MatrixUseAccumulator>(0);
-    coopMatLoad(am, a, 0u, 32u, gl_CooperativeMatrixLayoutRowMajor);
-    coopMatLoad(bm, b, 0u, 32u, gl_CooperativeMatrixLayoutColumnMajor);
+    coopMatLoad(am, a4, uint(CM_AELEM), uint(CM_ASTRIDE), gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(bm, b4, uint(CM_BELEM), uint(CM_BSTRIDE), gl_CooperativeMatrixLayoutColumnMajor);
     cm = coopMatMulAdd(am, bm, cm);
     coopMatStore(cm, o, 0u, 8u, gl_CooperativeMatrixLayoutRowMajor);
 }
+
+
+

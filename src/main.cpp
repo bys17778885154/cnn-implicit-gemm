@@ -295,13 +295,13 @@ static void create_pipeline_objects(Ctx& c) {
     vkDestroyShaderModule(c.dev, smod, nullptr);
 
     for (int l = 0; l < 5; ++l) {
-        int32_t spec[7] = {
+        int32_t spec[8] = {
             C_IN_PAD[l], C_OUT_PAD[l], C_OUT_REAL[l], l == 4 ? 1 : 0,
-            K_GEMM[l], (K_GEMM[l] + 31) / 32 * 32, (K_GEMM[l] + 31) / 32 * 32
+            K_GEMM[l], (K_GEMM[l] + 31) / 32 * 32, (K_GEMM[l] + 31) / 32 * 32, 192
         };
-        VkSpecializationMapEntry me[7];
-        for (int i = 0; i < 7; ++i) { me[i].constantID = i; me[i].offset = (uint32_t)(i * 4); me[i].size = 4; }
-        VkSpecializationInfo spi{ 7, me, sizeof(spec), spec };
+        VkSpecializationMapEntry me[8];
+        for (int i = 0; i < 8; ++i) { me[i].constantID = i; me[i].offset = (uint32_t)(i * 4); me[i].size = 4; }
+        VkSpecializationInfo spi{ 8, me, sizeof(spec), spec };
         VkComputePipelineCreateInfo ci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
         ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -354,7 +354,7 @@ static void run_layer(Ctx& c, int l, bool timing, uint32_t queryBase) {
     }
     vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipes[l]);
     vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pl, 0, 1, &c.ds, 0, nullptr);
-    vkCmdDispatch(c.cmd, (HW + 127) / 128, 1, 1);
+    vkCmdDispatch(c.cmd, (HW + 191) / 192, 1, 1);
     if (timing)
         vkCmdWriteTimestamp(c.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c.qp, queryBase + 1);
     VK_CHECK(vkEndCommandBuffer(c.cmd));
@@ -400,18 +400,18 @@ static bool download_and_cmp(Ctx& c, VkDeviceSize off, size_t bytes, const void*
 }
 
 static bool smoke_test(Ctx& c) {
-    static int8_t ha[16 * 32], hb[8 * 32];
+    static int8_t ha[32 * 32], hb[8 * 32];
     static int32_t href[16 * 8];
-    for (int i = 0; i < 16 * 32; ++i) ha[i] = (int8_t)((i * 7 + 3) % 251 - 125);
+    for (int i = 0; i < 32 * 32; ++i) ha[i] = (int8_t)((i * 7 + 3) % 251 - 125);
     for (int i = 0; i < 8 * 32; ++i) hb[i] = (int8_t)((i * 11 + 5) % 241 - 120);
         for (int m = 0; m < 16; ++m)
         for (int n = 0; n < 8; ++n) {
             int acc = 0;
-            for (int k = 0; k < 32; ++k) acc += (int)ha[m * 32 + k] * (int)hb[n * 32 + k];
+            for (int k = 0; k < 32; ++k)             acc += (int)ha[(m + 4) * 32 + k] * (int)hb[n * 32 + k];
             href[m * 8 + n] = acc;
         }
 
-    const VkDeviceSize oa = 0, ob = 1024, oo = 2048;
+    const VkDeviceSize oa = 0, ob = 2048, oo = 3072;
     memcpy((char*)c.stgmapped + oa, ha, sizeof(ha));
     memcpy((char*)c.stgmapped + ob, hb, sizeof(hb));
     memset((char*)c.stgmapped + oo, 0, 128 * 4);
@@ -548,6 +548,12 @@ int main(int argc, char** argv) {
     if (mode == "bench" || mode == "all") bench(c);
     return 0;
 }
+
+
+
+
+
+
 
 
 
