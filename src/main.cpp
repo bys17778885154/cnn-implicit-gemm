@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <windows.h>
 
 #define VK_CHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { \
     printf("VK error %d at %s:%d\n", (int)r_, __FILE__, __LINE__); exit(1); } } while (0)
@@ -31,7 +32,7 @@ struct Ctx {
     void* stgmapped = nullptr;
     VkDescriptorPool dpool = VK_NULL_HANDLE;
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
-    VkDescriptorSet ds = VK_NULL_HANDLE;
+    VkDescriptorSet ds[5] = {};
     VkPipelineLayout pl = VK_NULL_HANDLE;
     VkPipeline pipes[5] = {};
     VkPipeline smokepipe = VK_NULL_HANDLE;
@@ -165,7 +166,7 @@ static void init_vulkan(Ctx& c, bool verbose) {
 
     VkQueryPoolCreateInfo qpi{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
     qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    qpi.queryCount = 256;
+    qpi.queryCount = 512;
     VK_CHECK(vkCreateQueryPool(c.dev, &qpi, nullptr, &c.qp));
 }
 
@@ -253,17 +254,18 @@ static void create_pipeline_objects(Ctx& c) {
     pli.pSetLayouts = &c.dsl;
     VK_CHECK(vkCreatePipelineLayout(c.dev, &pli, nullptr, &c.pl));
 
-    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 };
+    VkDescriptorPoolSize ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 };
     VkDescriptorPoolCreateInfo dpi{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    dpi.maxSets = 4;
+    dpi.maxSets = 8;
     dpi.poolSizeCount = 1;
     dpi.pPoolSizes = &ps;
     VK_CHECK(vkCreateDescriptorPool(c.dev, &dpi, nullptr, &c.dpool));
     VkDescriptorSetAllocateInfo dai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
     dai.descriptorPool = c.dpool;
-    dai.descriptorSetCount = 1;
-    dai.pSetLayouts = &c.dsl;
-    VK_CHECK(vkAllocateDescriptorSets(c.dev, &dai, &c.ds));
+    VkDescriptorSetLayout layouts[5] = { c.dsl, c.dsl, c.dsl, c.dsl, c.dsl };
+    dai.descriptorSetCount = 5;
+    dai.pSetLayouts = layouts;
+    VK_CHECK(vkAllocateDescriptorSets(c.dev, &dai, c.ds));
 
     VkShaderModule mod = load_spv(c.dev, c.scope == 3 ? "build/conv_subgroup.spv" : "build/conv_workgroup.spv");
 
@@ -283,6 +285,7 @@ static void create_pipeline_objects(Ctx& c) {
     spli.pSetLayouts = &c.smokedsl;
     VK_CHECK(vkCreatePipelineLayout(c.dev, &spli, nullptr, &c.smokelayout));
     dai.pSetLayouts = &c.smokedsl;
+    dai.descriptorSetCount = 1;
     VK_CHECK(vkAllocateDescriptorSets(c.dev, &dai, &c.smokedb));
     VkShaderModule smod = load_spv(c.dev, c.scope == 3 ? "build/smoke_subgroup.spv" : "build/smoke_workgroup.spv");
     VkComputePipelineCreateInfo sci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
@@ -314,7 +317,7 @@ static void create_pipeline_objects(Ctx& c) {
     vkDestroyShaderModule(c.dev, mod, nullptr);
 }
 
-static void set_layer_descriptors(Ctx& c, int l, const int32_t* specDummy) {
+static void set_layer_descriptors(Ctx& c, int l) {
     const Offsets& o = c.off;
     VkDeviceSize inOff[5] = { o.a0, o.x0, o.x1, o.x0, o.x1 };
     VkDeviceSize out8[5] = { o.x0, o.x1, o.x0, o.x1, o.x1 };
@@ -334,7 +337,7 @@ static void set_layer_descriptors(Ctx& c, int l, const int32_t* specDummy) {
     VkWriteDescriptorSet wr[NBIND] = {};
     for (int i = 0; i < NBIND; ++i) {
         wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        wr[i].dstSet = c.ds;
+        wr[i].dstSet = c.ds[l];
         wr[i].dstBinding = i;
         wr[i].descriptorCount = 1;
         wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -343,8 +346,9 @@ static void set_layer_descriptors(Ctx& c, int l, const int32_t* specDummy) {
     vkUpdateDescriptorSets(c.dev, NBIND, wr, 0, nullptr);
 }
 
-static void run_layer(Ctx& c, int l, bool timing, uint32_t queryBase) {
-    set_layer_descriptors(c, l, nullptr);
+static bool g_use_barrier = true;
+
+static void record_chain(Ctx& c, int last_layer, bool timing, uint32_t queryBase) {
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(c.cmd, &bi));
@@ -352,12 +356,44 @@ static void run_layer(Ctx& c, int l, bool timing, uint32_t queryBase) {
         vkCmdResetQueryPool(c.cmd, c.qp, queryBase, 2);
         vkCmdWriteTimestamp(c.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c.qp, queryBase);
     }
-    vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipes[l]);
-    vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pl, 0, 1, &c.ds, 0, nullptr);
-    vkCmdDispatch(c.cmd, (HW + 191) / 192, 1, 1);
+    for (int l = 0; l <= last_layer; ++l) {
+        if (l > 0 && g_use_barrier) {
+            VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                VK_ACCESS_SHADER_WRITE_BIT,
+                                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
+            vkCmdPipelineBarrier(c.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        }
+        vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipes[l]);
+        vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pl, 0, 1, &c.ds[l], 0, nullptr);
+        vkCmdDispatch(c.cmd, (HW + 191) / 192, 1, 1);
+    }
     if (timing)
         vkCmdWriteTimestamp(c.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c.qp, queryBase + 1);
     VK_CHECK(vkEndCommandBuffer(c.cmd));
+}
+
+static void submit_and_wait(Ctx& c);
+
+static double time_single_layer(Ctx& c, int l) {
+    VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(c.cmd, &bi));
+    vkCmdResetQueryPool(c.cmd, c.qp, 200, 2);
+    vkCmdWriteTimestamp(c.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c.qp, 200);
+    vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipes[l]);
+    vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pl, 0, 1, &c.ds[l], 0, nullptr);
+    vkCmdDispatch(c.cmd, (HW + 191) / 192, 1, 1);
+    vkCmdWriteTimestamp(c.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c.qp, 201);
+    VK_CHECK(vkEndCommandBuffer(c.cmd));
+    submit_and_wait(c);
+    uint64_t ts[2] = {};
+    VK_CHECK(vkGetQueryPoolResults(c.dev, c.qp, 200, 2, 16, ts, 8,
+                                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+    return (double)(ts[1] - ts[0]) * c.tsPeriod / 1e6;
+}
+
+static void submit_and_wait(Ctx& c) {
     VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
     si.commandBufferCount = 1;
     si.pCommandBuffers = &c.cmd;
@@ -368,6 +404,11 @@ static void run_layer(Ctx& c, int l, bool timing, uint32_t queryBase) {
     VK_CHECK(vkWaitForFences(c.dev, 1, &fence, VK_TRUE, UINT64_MAX));
     vkDestroyFence(c.dev, fence, nullptr);
     VK_CHECK(vkResetCommandBuffer(c.cmd, 0));
+}
+
+static void run_chain(Ctx& c, int last_layer, bool timing, uint32_t queryBase = 0) {
+    record_chain(c, last_layer, timing, queryBase);
+    submit_and_wait(c);
 }
 
 static bool download_and_cmp(Ctx& c, VkDeviceSize off, size_t bytes, const void* ref, const char* what) {
@@ -472,9 +513,10 @@ static void validate_chain(Ctx& c) {
     std::vector<int8_t> inter[4];
     std::vector<float> ref_out;
     cpu_int8(m, inter, ref_out);
+    for (int l = 0; l < 5; ++l) set_layer_descriptors(c, l);
     bool ok = true;
     for (int l = 0; l < 5 && ok; ++l) {
-        for (int t = 0; t <= l; ++t) run_layer(c, t, false, 0);
+        run_chain(c, l, false);
         char name[32];
         if (l < 4) {
             snprintf(name, sizeof(name), "coopmat layer %d", l);
@@ -499,33 +541,50 @@ static void validate_chain(Ctx& c) {
     }
 }
 
-static void bench(Ctx& c) {
-    for (int i = 0; i < 3; ++i)
-        for (int l = 0; l < 5; ++l) run_layer(c, l, false, 0);
+static void bench(Ctx& c, const ModelData& m) {
+    for (int l = 0; l < 5; ++l) set_layer_descriptors(c, l);
+    vkResetQueryPool(c.dev, c.qp, 0, 512);
+    for (int i = 0; i < 3; ++i) run_chain(c, -1, false, 0);
     const int iters = 20;
     float acc[5] = { 0, 0, 0, 0, 0 };
-    std::vector<uint64_t> ts(2);
-    for (int i = 0; i < iters; ++i)
-        for (int l = 0; l < 5; ++l) {
-            uint32_t qb = (uint32_t)(l * 2);
-            run_layer(c, l, true, qb);
-            VK_CHECK(vkGetQueryPoolResults(c.dev, c.qp, qb, 2, 16, ts.data(), 8,
-                                           VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
-            acc[l] += (float)((double)(ts[1] - ts[0]) * c.tsPeriod / 1e6);
-        }
+    double wall = 0;
+    double gpu_total = 0;
+    LARGE_INTEGER freq, t0, t1;
+    QueryPerformanceFrequency(&freq);
+    for (int i = 0; i < iters; ++i) {
+        QueryPerformanceCounter(&t0);
+        run_chain(c, -1, true, (uint32_t)(i * 2));
+        QueryPerformanceCounter(&t1);
+        wall += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+        uint64_t ts[2] = {};
+        VK_CHECK(vkGetQueryPoolResults(c.dev, c.qp, (uint32_t)(i * 2), 2, 16, ts, 8,
+                                       VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+        gpu_total += (double)(ts[1] - ts[0]) * c.tsPeriod / 1e6;
+    }
+    for (int l = 0; l < 5; ++l)
+        for (int i = 0; i < iters; ++i)
+            acc[l] += (float)time_single_layer(c, l);
     double bytes = (double)HW * (16 + 16) + (double)HW * (16 + 32) + (double)HW * (32 + 16) +
                    (double)HW * (16 + 16) + (double)HW * (16 + 16);
-    double total = 0;
+    double lsum = 0;
     printf("%-8s", "coopmat");
     for (int l = 0; l < 5; ++l) {
         double v = acc[l] / iters;
-        total += v;
+        lsum += v;
         printf("  L%d=%7.3fms", l, v);
     }
-    printf("  total=%7.3fms  %.1f GB/s\n", total, bytes / (total * 1e6));
+    printf("  layers=%7.3fms  merged_wall=%7.3fms  %.1f GB/s (per-layer BW basis)\n",
+           lsum, wall / iters, bytes / (lsum * 1e6));
+    std::vector<int8_t> inter[4];
+    std::vector<float> ref_out;
+    cpu_int8(m, inter, ref_out);
+    VkDeviceSize outOff[5] = { c.off.x0, c.off.x1, c.off.x0, c.off.x1, c.off.outF };
+    (void)outOff;
+    download_and_cmp(c, c.off.outF, (size_t)HW * 16, ref_out.data(), "post-bench integrity");
 }
 
 int main(int argc, char** argv) {
+    if (argc > 2 && !strcmp(argv[2], "nobarrier")) g_use_barrier = false;
     setvbuf(stdout, nullptr, _IONBF, 0);
     std::string mode = argc > 1 ? argv[1] : "test";
     ModelData m;
@@ -545,9 +604,15 @@ int main(int argc, char** argv) {
         if (!smoke_test(c)) return 1;
         validate_chain(c);
     }
-    if (mode == "bench" || mode == "all") bench(c);
+    if (mode == "bench" || mode == "all") bench(c, m);
     return 0;
 }
+
+
+
+
+
+
 
 
 

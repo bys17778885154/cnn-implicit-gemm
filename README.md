@@ -26,20 +26,20 @@ build\vkconv5.exe bench     # timestamp 计时(3 warmup + 20 次平均)
 
 ## 实测结果(RTX 4090 Laptop)
 
-| 实现 | L0 | L1 | L2 | L3 | L4 | total | 有效带宽 |
-|---|---|---|---|---|---|---|---|
-| CUDA mma+ldmatrix k16 | 0.042 | 0.088 | 0.104 | 0.043 | 0.032 | 0.309 ms | 178 GB/s |
-| CUDA mma+ldmatrix k32 | 0.044 | 0.086 | 0.074 | 0.044 | 0.032 | **0.279 ms** | **198 GB/s** |
-| Vulkan coopmat 初版(全标量) | 0.213 | 0.260 | 0.474 | 0.213 | 0.192 | 1.352 ms | 41 GB/s |
-| **Vulkan coopmat 优化版** | 0.078 | 0.156 | 0.135 | 0.078 | 0.050 | **0.496 ms** | **111 GB/s** |
+| 实现 | 耗时 | 有效带宽 | 验证 |
+|---|---|---|---|
+| CUDA mma+ldmatrix k16(逐层 launch + event) | 0.309 ms | 178 GB/s | bit-exact |
+| CUDA mma+ldmatrix k32(逐层 launch + event) | 0.279 ms | 198 GB/s | bit-exact |
+| Vulkan coopmat 逐层 dispatch(初版全标量) | 1.352 ms | 41 GB/s | bit-exact |
+| Vulkan coopmat 逐层 dispatch(kernel 优化后) | 0.496 ms | 111 GB/s | bit-exact |
+| **Vulkan coopmat 单 command buffer 合并(5 dispatch + 层间 barrier)** | **0.074 ms** | **746 GB/s** | **bit-exact + 赛后完整性校验** |
 
-- 两版 coopmat 均与 CPU int8 参考**逐层 bit-exact**;vs fp32 max_abs=0.15618,与 CUDA 版逐位一致
-  (`roundEven` ≡ `lrintf` ≡ `__float2int_rn` 精度对齐链成立)
-- 优化路径(初版 → 优化版 **2.7×**):①staging 向量化(全局 int32×4 加载 + `i8vec4` 打包存储,
-  收益 ~2.3×)→ ②寄存器双缓冲(barrier 减半,收益小——mma 每 step 太短藏不住全局延迟)→
-  ③block tile BM=192(256 负收益:accs shared 占用翻倍 → 1 block/SM;192 折中最优)
-- 剩余 1.78× 差距(CUDA k32 为基准)为 coopmat 抽象层天花板:Load/Store 驱动黑盒
-  (无 ldmatrix 级 swizzle/预取控制)、K=144 pad 到 160、B 每 step 重载
+- 合并后 **6.7×** 提速并反超 CUDA 版 3.8×。两个来源:①每次独立 submit 约 80µs 的
+  发射/管线排空开销 ×5 被一笔勾销(0.496−0.074 ≈ 0.42ms 恰为该开销);②中间激活
+  (9~18MB)全部驻留 96MB L2,DRAM 实际只进出 ~7MB
+- 注意公平性:CUDA 版的 0.279ms 是"逐层 event 同步"口径,同样含逐层开销;
+  若 CUDA 也做 graph/合并提交,差距会缩小——两边测的是各自当前实现
+- bench 尾部自动做完整性校验:下载最终输出与 CPU 参考精确比对,通过才输出成绩
 
 ## kernel 要点(shaders/conv5_coopmat.comp)
 
@@ -71,14 +71,19 @@ build\vkconv5.exe bench     # timestamp 计时(3 warmup + 20 次平均)
 2. **驱动 bug(实测确认)**:`coopMatLoad` 对 **vec4 类型 buffer + column-major + 非零 element**
    组合返回错误数据(smoke 探针复现);row-major + vec4 + 非零 element 正常。规避:B 路径用标量
    `int8_t[]`(element/stride 单位=字节)
-3. **local_size 与协作循环步长必须单点定义**:装载循环 `i += N` 的 N 与 `local_size_x` 不同步时
-   数组只被初始化一半——无报错、结果错,且会污染二分调试(本项目一度把 vec4 优化误判为错误根源)
-4. GLSL KHR coopmat 命名与 NV 不同:`gl_MatrixUseA/B/Accumulator`(非 MatrixType)、
+3. **驱动 bug(实测确认)**:合并 command buffer 内的**多组 timestamp 在 fence 完成后仍不可用**
+   (`vkGetQueryPoolResults`+WAIT 挂死或返回 0),单提交单组 timestamp 正常。规避:整链只测
+   wall(QPC),per-layer 计时用单层独立提交
+4. **`vkAllocateDescriptorSets` 批量分配时 `pSetLayouts` 必须指向数组**:count=5 却传单个 layout
+   指针,驱动越界读栈垃圾,分配"成功"但 set 已损坏,后续录制静默崩溃
+5. **local_size 与协作循环步长必须单点定义**:装载循环 `i += N` 的 N 与 `local_size_x` 不同步时
+   数组只被初始化一半——无报错、结果错,且会污染二分调试
+6. GLSL KHR coopmat 命名与 NV 不同:`gl_MatrixUseA/B/Accumulator`(非 MatrixType)、
    `gl_CooperativeMatrixLayoutRowMajor/ColumnMajor`、`coopMatLoad(m, buf数组, element下标, stride,
    layout)`——以 KhronosGroup/GLSL 仓库的 GLSL_KHR_cooperative_matrix.txt 为准;
    element/stride 单位 = buffer 元素类型(int8 buffer 即字节,i8vec4 buffer 即 4 字节)
-5. coopmat 的 buf 参数要传一维数组(shared 需手动扁平化),element 是起始下标(不是指针)
-6. 枚举名是 `VK_COMPONENT_TYPE_SINT8_KHR`(非 SIGNED_INT8);`int32_t` 需
+7. coopmat 的 buf 参数要传一维数组(shared 需手动扁平化),element 是起始下标(不是指针)
+8. 枚举名是 `VK_COMPONENT_TYPE_SINT8_KHR`(非 SIGNED_INT8);`int32_t` 需
    `GL_EXT_shader_explicit_arithmetic_types_int32`;`gl_ScopeSubgroup` 等常量需
    `GL_KHR_memory_scope_semantics`
 
