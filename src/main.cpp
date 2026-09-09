@@ -411,6 +411,17 @@ static void run_chain(Ctx& c, int last_layer, bool timing, uint32_t queryBase = 
     submit_and_wait(c);
 }
 
+static void run_single_layer_untimed(Ctx& c, int l) {
+    VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(c.cmd, &bi));
+    vkCmdBindPipeline(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pipes[l]);
+    vkCmdBindDescriptorSets(c.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, c.pl, 0, 1, &c.ds[l], 0, nullptr);
+    vkCmdDispatch(c.cmd, (HW + 191) / 192, 1, 1);
+    VK_CHECK(vkEndCommandBuffer(c.cmd));
+    submit_and_wait(c);
+}
+
 static bool download_and_cmp(Ctx& c, VkDeviceSize off, size_t bytes, const void* ref, const char* what) {
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -564,6 +575,13 @@ static void bench(Ctx& c, const ModelData& m) {
     for (int l = 0; l < 5; ++l)
         for (int i = 0; i < iters; ++i)
             acc[l] += (float)time_single_layer(c, l);
+    double perlayer_wall = 0;
+    for (int i = 0; i < iters; ++i) {
+        QueryPerformanceCounter(&t0);
+        for (int l = 0; l < 5; ++l) run_single_layer_untimed(c, l);
+        QueryPerformanceCounter(&t1);
+        perlayer_wall += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+    }
     double bytes = (double)HW * (16 + 16) + (double)HW * (16 + 32) + (double)HW * (32 + 16) +
                    (double)HW * (16 + 16) + (double)HW * (16 + 16);
     double lsum = 0;
@@ -573,8 +591,10 @@ static void bench(Ctx& c, const ModelData& m) {
         lsum += v;
         printf("  L%d=%7.3fms", l, v);
     }
-    printf("  layers=%7.3fms  merged_wall=%7.3fms  %.1f GB/s (per-layer BW basis)\n",
-           lsum, wall / iters, bytes / (lsum * 1e6));
+    printf("\n  gpu_sum(per-layer)=%7.3fms  wall(per-layer submits)=%7.3fms  wall(merged submit)=%7.3fms"
+           "  [merged x100 -> benchmany mode]\n",
+           lsum, perlayer_wall / iters, wall / iters);
+    printf("  %.1f GB/s (per-layer BW basis)\n", bytes / (lsum * 1e6));
     std::vector<int8_t> inter[4];
     std::vector<float> ref_out;
     cpu_int8(m, inter, ref_out);

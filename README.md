@@ -24,23 +24,29 @@ build\vkconv5.exe bench     # timestamp 计时(3 warmup + 20 次平均)
 - 运行时查询 coopmat 属性并断言 **M=16 N=8 K=32 s8/s8/s32**(scope=subgroup),同时打印驱动暴露的全部形态
   (含 M=16 N=16 K=32 s8——即 CUDA 版假想文档里的 "m16n16k32",在 coopmat 层真实存在)
 
-## 实测结果(RTX 4090 Laptop)
+## 实测结果(RTX 4090 Laptop,交替背靠背同窗口测量)
 
-| 实现 | 耗时 | 有效带宽 | 验证 |
-|---|---|---|---|
-| CUDA mma+ldmatrix k16(逐层 launch + event) | 0.309 ms | 178 GB/s | bit-exact |
-| CUDA mma+ldmatrix k32(逐层 launch + event) | 0.279 ms | 198 GB/s | bit-exact |
-| Vulkan coopmat 逐层 dispatch(初版全标量) | 1.352 ms | 41 GB/s | bit-exact |
-| Vulkan coopmat 逐层 dispatch(kernel 优化后) | 0.496 ms | 111 GB/s | bit-exact |
-| Vulkan coopmat 单 command buffer 合并(benchmany:100 链/提交) | 0.477 ms | 115 GB/s | bit-exact + 赛后完整性校验 |
+**四方口径对比**(每格 20 次平均,交替运行 3 轮取中位):
+
+| 路径 | GPU 吞吐 | 端到端 wall |
+|---|---|---|
+| CUDA mma32 逐层 event 同步 | 0.24-0.28 ms | 0.31 ms |
+| CUDA mma32 异步连发(100 链/同步一次) | — | **0.29-0.30 ms** |
+| Vulkan coopmat 逐层 submit | 0.50 ms | 0.77 ms |
+| Vulkan coopmat 合并 cmdbuffer(100 链/提交) | 0.47 ms | **0.47 ms** |
 
 **三方逐位一致性已验证**:`dump` 模式导出 CPU / CUDA(mma32)/ Vulkan(合并链)的最终输出,
 SHA256 完全相同(`0DA656256659892F...`,1,146,240 个 fp32)。
 
-- command buffer 合并的真实收益仅 **~4%**(0.496 → 0.477ms),此前宣称的 6.7× 是测量 bug
-  (见踩坑 5)。单次提交的 wall(0.557ms)甚至略慢——host 侧录制/提交开销与 GPU 时间重叠不足
-- coopmat 版与 CUDA k32 的 1.7× 差距仍在:coopmatLoad/Store 驱动黑盒、K pad 到 160、
-  B 每 step 重载——WMMA 级 API 的固有天花板
+结论:
+- **CUDA 全口径领先 1.6-1.7×**(0.29 vs 0.47ms)。合并 cmdbuffer 让 Vulkan 端到端快 30%
+  (0.77→0.47ms,5 次 host 提交往返变 1 次),但追不平 CUDA:CUDA kernel 异步发射开销仅
+  ~2-5µs/个,而 Vulkan 路径每个 dispatch 有 ~90µs 的固定成本(0.47ms ÷ 5,推测来自
+  驱动的 compute pipeline 切换/barrier 处理,与 SM 频率无关)
+- 笔记本 GPU 时钟波动注记:CUDA 偶发 boost 状态下可达 0.16ms(344 GB/s),同 exe 复测回落
+  0.28ms;跨会话数字不可直接比,本表为交替背靠背口径
+- coopmat 版与 CUDA 的剩余差距构成:上述 dispatch 固定成本 + coopmatLoad/Store 黑盒 +
+  K pad 到 160 + B 每 step 重载
 - bench 尾部自动做完整性校验:下载最终输出与 CPU 参考精确比对,通过才输出成绩
 
 ## kernel 要点(shaders/conv5_coopmat.comp)
