@@ -34,16 +34,16 @@ build\vkconv5.exe dump      # 导出 out_vk.bin + out_cpu.bin(跨实现逐位比
 |---|---|---|
 | CUDA mma32 逐层 event 同步 | 0.24-0.28 ms | 0.31 ms |
 | CUDA mma32 异步连发(100 链/同步一次) | — | **0.29-0.30 ms** |
-| Vulkan coopmat 逐层 submit | 0.50 ms | 0.77 ms |
-| Vulkan coopmat 合并 cmdbuffer(100 链/提交) | 0.47 ms | **0.47 ms** |
+| Vulkan coopmat 逐层 submit | 0.42 ms | 0.65 ms |
+| Vulkan coopmat 合并 cmdbuffer(100 链/提交) | 0.40-0.43 ms | **0.40-0.43 ms** |
 
 **三方逐位一致性已验证**:`dump` 模式导出 CPU / CUDA(mma32)/ Vulkan(合并链)的最终输出,
 SHA256 完全相同(`0DA656256659892F...`,1,146,240 个 fp32)。
 
 结论:
-- **CUDA 全口径领先 1.6-1.7×**(0.29 vs 0.47ms)。合并 cmdbuffer 让 Vulkan 端到端快 30%
-  (0.77→0.47ms,5 次 host 提交往返变 1 次),但追不平 CUDA:CUDA kernel 异步发射开销仅
-  ~2-5µs/个,而 Vulkan 路径每个 dispatch 有 ~90µs 的固定成本(0.47ms ÷ 5,推测来自
+- CUDA 全口径领先约 1.5×(0.29 vs 0.40-0.43ms)。合并 cmdbuffer 让 Vulkan 端到端快 ~35%
+  (0.65→0.42ms,5 次 host 提交往返变 1 次),但追不平 CUDA:CUDA kernel 异步发射开销仅
+  ~2-5µs/个,而 Vulkan 路径每个 dispatch 有 ~80µs 的固定成本(推测来自
   驱动的 compute pipeline 切换/barrier 处理,与 SM 频率无关)
 - 笔记本 GPU 时钟波动注记:CUDA 偶发 boost 状态下可达 0.16ms(344 GB/s),同 exe 复测回落
   0.28ms;跨会话数字不可直接比,本表为交替背靠背口径
@@ -61,15 +61,17 @@ SHA256 完全相同(`0DA656256659892F...`,1,146,240 个 fp32)。
   ——K=144 统一 pad 到 160(5×32 步,1/9 mma 浪费,单一代码路径;CUDA 版走 k16 残尾步)
 - **双缓冲**:下一 k-step 的加载先入 8×int32 寄存器,当前 buffer 上 coopmat 装载 + MulAdd,
   再 STS 到另一 buffer,每步仅 1 次 barrier
-- epilogue:`coopMatStore` 累加器 → shared int32 `[BM][COUT]` 整行暂存 → barrier → 逐元素
-  `int(roundEven(float(acc+bias_q)*mult))` clamp(0,127)(ReLU 折叠进下界);L4 直写 fp32 NHWC
-- shared 占用逐层:As 12KB(双缓冲 2×192×32B)+ Bs 1.3-5KB + accs 6-24KB
-  → L0/L2/L3 ≈ 26-28KB(3 blocks/SM)、L1 41KB(2 blocks/SM)、L4 19KB(5 blocks/SM)
-- **epilogue 的 accs 整行暂存是刻意的**(实测教训):曾尝试改为 per-subgroup 16×8 tile
-  乒乓 scratch(shared 降到 6KB,L1 41→23KB、理论 2→4 blocks/SM),结果整体**慢 50%**
-  (0.47→0.71ms,bit-exact 仍通过)——16×8 tile 只能产出 8B 碎片写回(整行暂存 =
-  16/32B 连续字节写),且每 tile 2 次 barrier;本 kernel 不是 occupancy 受限,
-  **写回合并度**才是 epilogue 的关键,故保留整行方案
+- epilogue:按 subgroup 分 6 轮——每轮该 subgroup 把自己的 2×NT 个 16×8 tile
+  `coopMatStore` 到 **单 subgroup 整行 scratch `[32][COUT]`**(行宽 = 完整 COUT),
+  barrier 后全 192 线程 requant 写回 `int(roundEven(float(acc+bias_q)*mult))` clamp(0,127)
+  (ReLU 折叠进下界);L4 直写 fp32 NHWC
+- **shared 峰值 21KB(L1 层)**,全部 ≤40KB 约束内:As 12KB(双缓冲 2×192×32B)+
+  Bs 1.3-5KB + escr 1-4KB → L0/L3 16.5KB、L2 18.5KB、L1 21KB、L4 14.25KB
+- **epilogue scratch 的两次演进(实测数据)**:
+  1. 整块 `[BM][COUT]` accs(24KB,L1 总 41KB):0.47ms——写回合并度最好但超 40KB 约束
+  2. per-subgroup 16×8 tile 乒乓(6KB):0.71ms(+50%)——8B 碎片写回,负优化,已回滚
+  3. **现行:单 subgroup 整行 `[32][COUT]`(4KB,L1 总 21KB):0.40-0.43ms(-11%)**
+     ——行宽不变保住 16/32B 连续写,占用率提升(L1 2→4 blocks/SM)真正兑现
 - 双 scope 宏变体(subgroup/workgroup)预编译,按运行时查询结果选择
 
 ## 冒烟测试(shaders/smoke.comp)

@@ -40,7 +40,7 @@ layout(std430, binding = 5) buffer OutFBuf { float fout[]; };
 
 shared i8vec4 As[2 * BM * 8];
 shared int8_t Bs[COUT * BST];
-shared int accs[BM * COUT];
+shared int escr[32 * COUT];
 
 void stage_tile(int tid, int row0, int gk0base, int bufbase, int step) {
     int row = row0;
@@ -145,28 +145,30 @@ void main() {
         barrier();
     }
 
-    for (int ni = 0; ni < NT; ++ni) {
-        coopMatStore(acc[ni * 2 + 0], accs, uint(sbase * COUT + ni * 8), uint(COUT),
-                     gl_CooperativeMatrixLayoutRowMajor);
-        coopMatStore(acc[ni * 2 + 1], accs, uint((sbase + 16) * COUT + ni * 8), uint(COUT),
-                     gl_CooperativeMatrixLayoutRowMajor);
-    }
-    barrier();
-
-    for (int i = tid; i < BM * COUT; i += 192) {
-        int r = i / COUT;
-        int k = i % COUT;
-        if (k >= COUT_R) continue;
-        int gr = wg * BM + r;
-        if (gr >= HW) continue;
-        int v = accs[r * COUT + k] + bq[k];
-        if (LAST != 0) {
-            fout[gr * COUT_R + k] = float(v) * mult[k];
-        } else {
-            int y = int(roundEven(float(v) * mult[k]));
-            y = clamp(y, 0, 127);
-            y8[gr * COUT_R + k] = int8_t(y);
+    for (int s = 0; s < 6; ++s) {
+        if (sg == s) {
+            for (int mi = 0; mi < 2; ++mi)
+                for (int ni = 0; ni < NT; ++ni)
+                    coopMatStore(acc[ni * 2 + mi], escr, uint(mi * 16 * COUT + ni * 8), uint(COUT),
+                                 gl_CooperativeMatrixLayoutRowMajor);
         }
+        barrier();
+        for (int i = tid; i < 32 * COUT; i += 192) {
+            int r = i / COUT;
+            int k = i % COUT;
+            if (k >= COUT_R) continue;
+            int gr = wg * BM + s * 32 + r;
+            if (gr >= HW) continue;
+            int v = escr[i] + bq[k];
+            if (LAST != 0) {
+                fout[gr * COUT_R + k] = float(v) * mult[k];
+            } else {
+                int y = int(roundEven(float(v) * mult[k]));
+                y = clamp(y, 0, 127);
+                y8[gr * COUT_R + k] = int8_t(y);
+            }
+        }
+        barrier();
     }
 }
 
