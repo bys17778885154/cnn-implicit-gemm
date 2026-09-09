@@ -16,7 +16,9 @@ conv(4→16)+ReLU → conv(16→32)+ReLU → conv(32→16)+ReLU → conv(16→16
 ```
 powershell build.ps1        # CUDA 12.1 + VS2019 工具链, sm_89
 build\conv5.exe test        # fragment 微测试 + 三实现逐层 bit-exact 验证
-build\conv5.exe bench       # 计时(3 warmup + 20 次平均)
+build\conv5.exe bench       # 计时(3 warmup + 20 次平均,逐层 event 口径)
+build\conv5.exe benchcmp    # 四口径计时(GPU 和 / 逐层同步 wall / 异步单链 / 异步×100)
+build\conv5.exe dump        # 导出 mma32 最终输出 out_cuda.bin(用于跨实现逐位比对)
 build\conv5.exe gen         # 重新生成 weights.bin / input.bin
 ```
 
@@ -33,6 +35,29 @@ build\conv5.exe gen         # 重新生成 weights.bin / input.bin
 - k32 收益集中在 L2(K=288=9×32 整除,-29%);K=144 的层 = 4 个 k32 步 + 1 个 k16 残尾步,收益被尾步抵消(±0)
 - 三个版本与 CPU int8 参考**逐层 bit-exact**(整型累加无舍入,验收为精确相等)
 - vs CPU fp32 参考:平均绝对误差 0.023(参考输出均值 0.904,平均相对误差 ≈ 2.6%,per-tensor 对称量化的固有噪声水平)
+
+## 跨实现对比(vs Vulkan coopmat,`../vkconv5`)
+
+`benchcmp` 模式输出四种口径(GPU 事件和 / 逐层同步 wall / 异步单链 wall / 异步×100),
+与 Vulkan 版**交替背靠背**测量(同窗口,3 轮取中位):
+
+| 路径 | GPU 吞吐 | 端到端 wall |
+|---|---|---|
+| **CUDA mma32 逐层 event 同步** | 0.24-0.28 ms | 0.31 ms |
+| **CUDA mma32 异步连发**(100 链/1 次同步) | — | **0.29-0.30 ms** |
+| Vulkan coopmat 逐层 submit | 0.50 ms | 0.77 ms |
+| Vulkan coopmat 合并 cmdbuffer(100 链/1 次提交) | 0.47 ms | 0.47 ms |
+
+**三方逐位一致性**:dump 模式导出的 CPU / CUDA / Vulkan 最终输出 SHA256 完全相同
+(`0DA656256659892F...`,1,146,240 个 fp32)。
+
+分析:
+- CUDA 全口径领先 **1.6-1.7×**(0.29 vs 0.47ms),即便 Vulkan 已做 command buffer 合并
+- CUDA kernel 异步发射开销仅 ~2-5µs/个(wall 0.30 ≈ GPU 0.28 + 发射);
+  Vulkan 路径每个 dispatch 有 ~90µs 固定成本(0.47÷5)且与 SM 频率无关
+  ——推测为驱动的 compute pipeline 切换/barrier 处理,属 API 层调度开销
+- 笔记本 GPU 时钟波动注记:CUDA 偶发 boost 下到过 0.16ms(344 GB/s),同 exe 复测回落 0.28ms;
+  跨会话数字不可直接比,跨实现对比一律用交替背靠背口径
 
 ## v3 kernel 要点(src/conv_mma.cu)
 
