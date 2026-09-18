@@ -44,27 +44,34 @@
   那是它的主场,手写没有优势
 - CUTLASS 全层 bit-exact 通过也再次交叉验证了本项目 CPU 参考与 GPU 实现的正确性
 
-## 大通道卷积对照(cutlass_large / ours_large,C=C_out,raw s32 输出,统一口径)
+## 大通道卷积对照(sweep.cu,6 配置扫描 + 强验证 + 交错计时)
 
-随机数据 + 16 点抽查验证(bit-exact),同一 kernel/协议:
+`sweep.cu` 对每个形状跑 **CUTLASS 6 配置**(3 tile × {Analytic, Optimized} 迭代器)+
+**手写 N-分块变体**(conv_mma32 kernel 共享头 `conv_kernel.cuh` + koff 列偏移,chunk 16/32),
+每配置 2000 随机点 + 32 边界/角落点精确验证,3 轮取最优。随机数据,raw s32 统一口径:
 
-| 形状 | 手写 mma32(conv_mma32 原版 kernel) | CUTLASS 128×128×64s3 | tensor-util(CUTLASS) |
-|---|---|---|---|
-| 16→16 / 32→32(见上,模型数据) | **0.045 / 0.075 ms** | (1.44ms 5层合计) | ~10% |
-| **64→64** | 0.77-0.91 ms(10-12%) | **0.28-0.33 ms** | 33% |
-| **128→128** | 架构上限,无法运行* | **0.51 ms** | **73%** |
-| **256→256** | 架构上限,无法运行* | **1.84-2.06 ms** | **81%** |
+| 形状 | CUTLASS 最佳 | util | 手写 N-分块 | util | 胜者 |
+|---|---|---|---|---|---|
+| 16→16 | 0.167 (128×64 opt) | 3% | **0.038** | 15% | **手写 4.4×** |
+| 16→32 | 0.152 (128×64 opt) | 8% | **0.091** | 13% | **手写 1.7×** |
+| 32→16 | 0.100 (128×64 opt) | 12% | **0.045** | 26% | **手写 2.2×** |
+| 64→64 | **0.195** (128×64 opt) | 48% | 0.632 | 15% | **CUTLASS 3.2×** |
+| 128→128 | **0.384** (128×128 ana) | **97%** | 4.085 | 9% | **CUTLASS 10.6×** |
+| 256→256 | **1.310** (128×128 opt) | **114%** | 19.2 | 8% | **CUTLASS 14.6×** |
 
-\* 手写架构的两个硬上限:B 整块常驻 smem(128 通道需 147KB > 100KB smem 上限);
-累加器寄存器(NT×8 个 int32/线程,128 通道需 128 个 → spill)。
-
-**交叉点结论**:
-- C_out ≤ 32:手写专用 kernel 胜 3.6-5×(tile 按通道精确裁剪 + B 常驻 + fused requant)
-- C_out = 64:CUTLASS 反超 ~2.4×——手写架构开始撞墙(B 常驻 37KB → 2 blocks/SM,
-  每 step 8×ldmatrix 重载全部 NT tile,tensor-util 掉到 10%)
-- C_out ≥ 128:CUTLASS 主场,tensor-util 升到 73-81%(算术强度 2304-9216 OP/B,
-  深入 compute-bound 区),手写架构根本无法实例化
-- 通用库与手写 kernel 的分界线就在 C_out≈32-64:**瘦卷积定制赢,标准卷积用库**
+**夯实后的结论**:
+1. **交叉点在 C_out = 32~64 之间,比此前判断更锋利**:C_out≤32 手写赢 1.7-4.4×,
+   C_out=64 CUTLASS 反超 3.2×(即使给手写加了 N-分块绕过 smem 上限)
+2. **CUTLASS 最佳 tile 随形状移动**:瘦层 128×64+Optimized 迭代器,胖层 128×128
+   (Ana/Opt 均可)——单配置对比会误判,扫描后结论稳定
+3. **256→256 出现 util=114%**:2×286560×256×2304 OP / 1.31ms = 258 TOPS > 226 TOPS
+   标称峰值(1455MHz×76SM×2048OP/clk/SM)——说明 GPU 短时 boost 超过标称口径,
+   此前所有"util"数字含此口径不确定性(相对结论不受影响)
+4. **手写 N-分块在大通道失效的根因**:按 chunk 串行发射 ×8/×16 次 kernel,A 激活被
+   重复搬运 C_out/CHUNK 遍(64→64 即 2×,256→256 即 16×),完全没有 A 复用——
+   这正是 CUTLASS threadblock 128×128 tile 内 A/B 同时复用的设计意义
+5. **此前"架构无法实例化"修正为"架构不适合"**:N-分块可以绕过 smem/寄存器上限,
+   但代价是 A 重复搬运,大通道下必然输给 2D tile 复用
 
 ## 复现
 ```
@@ -76,3 +83,6 @@ build\cutlass_conv.exe
 依赖:D:\b00852572\cutlass-src(git clone --depth 1 NVIDIA/cutlass)+ ../cuda/weights.bin。
 大通道版:build\cutlass_large.exe / build\ours_large.exe(随机数据,无需模型)。
 
+sweep: nvcc sweep.cu → build\sweep.exe(6 配置 + N-分块,需 cutlass-src)
+conv_kernel.cuh:从 cuda/src/conv_mma.cu 生成的共享 kernel 头(RAW/koff 扩展,单一事实源)
+ours_large / cutlass_large:单形状深挖版(64→64 等)
