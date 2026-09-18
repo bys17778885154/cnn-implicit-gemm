@@ -1,4 +1,4 @@
-# CUTLASS int8 conv2d fprop 对照基准(cnn-int8/bench)
+﻿# CUTLASS int8 conv2d fprop 对照基准(cnn-int8/bench)
 
 用 CUTLASS(生产级 implicit GEMM 库)的 SM80 s8 conv kernel 跑我们的 5 层网络,
 与手写 conv5(mma.sync + ldmatrix)同数据、同协议对比。
@@ -44,8 +44,29 @@
   那是它的主场,手写没有优势
 - CUTLASS 全层 bit-exact 通过也再次交叉验证了本项目 CPU 参考与 GPU 实现的正确性
 
-## 复现
+## 大通道卷积对照(cutlass_large / ours_large,C=C_out,raw s32 输出,统一口径)
 
+随机数据 + 16 点抽查验证(bit-exact),同一 kernel/协议:
+
+| 形状 | 手写 mma32(conv_mma32 原版 kernel) | CUTLASS 128×128×64s3 | tensor-util(CUTLASS) |
+|---|---|---|---|
+| 16→16 / 32→32(见上,模型数据) | **0.045 / 0.075 ms** | (1.44ms 5层合计) | ~10% |
+| **64→64** | 0.77-0.91 ms(10-12%) | **0.28-0.33 ms** | 33% |
+| **128→128** | 架构上限,无法运行* | **0.51 ms** | **73%** |
+| **256→256** | 架构上限,无法运行* | **1.84-2.06 ms** | **81%** |
+
+\* 手写架构的两个硬上限:B 整块常驻 smem(128 通道需 147KB > 100KB smem 上限);
+累加器寄存器(NT×8 个 int32/线程,128 通道需 128 个 → spill)。
+
+**交叉点结论**:
+- C_out ≤ 32:手写专用 kernel 胜 3.6-5×(tile 按通道精确裁剪 + B 常驻 + fused requant)
+- C_out = 64:CUTLASS 反超 ~2.4×——手写架构开始撞墙(B 常驻 37KB → 2 blocks/SM,
+  每 step 8×ldmatrix 重载全部 NT tile,tensor-util 掉到 10%)
+- C_out ≥ 128:CUTLASS 主场,tensor-util 升到 73-81%(算术强度 2304-9216 OP/B,
+  深入 compute-bound 区),手写架构根本无法实例化
+- 通用库与手写 kernel 的分界线就在 C_out≈32-64:**瘦卷积定制赢,标准卷积用库**
+
+## 复现
 ```
 cd bench
 powershell build.ps1        # 128x128x64 → build\cutlass_conv.exe
@@ -53,3 +74,5 @@ powershell build64.ps1      # 128x64x64  → build\cutlass_conv64.exe
 build\cutlass_conv.exe
 ```
 依赖:D:\b00852572\cutlass-src(git clone --depth 1 NVIDIA/cutlass)+ ../cuda/weights.bin。
+大通道版:build\cutlass_large.exe / build\ours_large.exe(随机数据,无需模型)。
+
