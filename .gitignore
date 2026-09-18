@@ -8,3 +8,4 @@ build/
 *.nsys-rep
 *.sqlite
 *.csv
+bench/build/
